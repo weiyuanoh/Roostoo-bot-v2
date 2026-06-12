@@ -1,0 +1,21 @@
+{
+  "alpha_windows": [
+    6,
+    12,
+    24
+  ],
+  "end": "2026-06-08 17:00:00+00:00",
+  "end_ms": 1780938000000,
+  "failures": [],
+  "feature_path": "notebooks/microstructure/momentum_roll_impact_is_os_1h_features_8m.csv",
+  "history_months": 8,
+  "interval": "1h",
+  "microstructure_window": 50,
+  "pairs_loaded": 43,
+  "pairs_requested": 43,
+  "raw_path": "notebooks/microstructure/momentum_roll_impact_is_os_1h_raw_8m.csv",
+  "rows_features": 250819,
+  "rows_raw": 250819,
+  "start": "2025-10-08 17:00:00+00:00",
+  "start_ms": 1759942800000
+}

@@ -1,0 +1,16 @@
+{
+  "alpha_windows": [
+    6,
+    12,
+    24
+  ],
+  "feature_count": 27,
+  "feature_rows": 43000,
+  "generated_at": "2026-06-05T21:26:03.604448+00:00",
+  "horizon": 6,
+  "interval": "1h",
+  "microstructure_window": 50,
+  "pairs": 43,
+  "raw_rows": 43000,
+  "raw_source": "/home/weiyuanoh/projects/roostoo-bot-v2/notebooks/microstructure/ic_checks_1h_candles_raw.csv"
+}

@@ -1,0 +1,31 @@
+[project]
+name = "roostoo-bot"
+version = "0.1.0"
+description = "Market Microstructure Crypto Bot"
+readme = "README.md"
+authors = [
+    {name = "weiyuanoh"}
+]
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "requests (>=2.34.2,<3.0.0)",
+    "pandas (>=3.0.3,<4.0.0)",
+    "numpy (>=2.4.6,<3.0.0)",
+    "python-dotenv (>=1.2.2,<2.0.0)",
+    "pydantic (>=2.13.4,<3.0.0)"
+]
+
+[project.scripts]
+roostoo-bot = "bot.main:main"
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.3,<10.0.0)",
+    "ruff (>=0.15.14,<0.16.0)",
+    "ipykernel (>=7.2.0,<8.0.0)"
+]

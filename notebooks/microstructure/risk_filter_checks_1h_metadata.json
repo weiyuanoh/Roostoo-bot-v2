@@ -1,0 +1,27 @@
+{
+  "candles": "1h Binance spot candles from cached research data",
+  "cost_bps": 20,
+  "end_open_time": "1780689600000",
+  "horizons": [
+    6,
+    12,
+    24
+  ],
+  "min_assets_per_timestamp": 8,
+  "momentum_feature": "vol_adj_momentum_24",
+  "pairs": 43,
+  "risk_features": [
+    "vpin",
+    "roll_impact",
+    "amihud",
+    "roll_measure",
+    "combined_micro_risk"
+  ],
+  "rows": 43000,
+  "source_features": "notebooks/feature/feature_checks_1h_h6_features.csv",
+  "start_open_time": "1777093200000",
+  "top_ks": [
+    3,
+    5
+  ]
+}
