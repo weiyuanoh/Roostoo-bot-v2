@@ -29,6 +29,7 @@ from bot.strategy.ridge import (
     score_frame,
     select_ridge_model,
 )
+from bot.strategy.regime import RegimeThrottleConfig, add_roll_impact_regime
 
 
 DEFAULT_OUTPUT_DIR = Path("notebooks/microstructure")
@@ -38,6 +39,27 @@ DEFAULT_POSITION_FRACTION = 1 / 20
 DEFAULT_EXIT_THRESHOLD = 0.50
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 0.0
+
+
+def parse_pairs(value: str | None) -> tuple[str, ...] | None:
+    """Parse an optional comma-separated pair filter for backtests."""
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return None
+    pairs = tuple(part.strip().upper() for part in value.split(",") if part.strip())
+    if not pairs:
+        return None
+    return pairs
+
+
+def filter_pairs(frame: pd.DataFrame, pairs: tuple[str, ...] | None) -> pd.DataFrame:
+    """Restrict a model frame to a requested pair universe."""
+    if pairs is None:
+        return frame
+    selected = frame[frame["pair"].isin(pairs)].copy()
+    missing = sorted(set(pairs) - set(selected["pair"].unique()))
+    if missing:
+        raise ValueError(f"pairs not present in feature frame: {', '.join(missing)}")
+    return selected
 
 
 def run_portfolio_backtest(
@@ -59,6 +81,8 @@ def run_portfolio_backtest(
     max_positions: int | None = None,
     top_k: int | None = None,
     max_new_entries: int | None = None,
+    regime_config: RegimeThrottleConfig | None = None,
+    rank_exit_threshold: int | None = None,
     exchange_info: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if not 0 < position_fraction <= 1:
@@ -73,7 +97,11 @@ def run_portfolio_backtest(
         raise ValueError("top_k must be positive when set")
     if max_new_entries is not None and max_new_entries <= 0:
         raise ValueError("max_new_entries must be positive when set")
+    if rank_exit_threshold is not None and rank_exit_threshold <= 0:
+        raise ValueError("rank_exit_threshold must be positive when set")
     max_positions = max_positions or max(1, int(np.floor(1 / position_fraction)))
+    if regime_config is not None:
+        frame = add_roll_impact_regime(frame, regime_config)
     folds = make_folds(frame, is_months=is_months, os_months=os_months, step_months=step_months)
     target_col = f"forward_return_{horizon}"
 
@@ -122,6 +150,8 @@ def run_portfolio_backtest(
                 max_positions=max_positions,
                 top_k=top_k,
                 max_new_entries=max_new_entries,
+                regime_config=regime_config,
+                rank_exit_threshold=rank_exit_threshold,
                 take_profit=tp,
                 stop_loss=sl,
             )
@@ -132,6 +162,7 @@ def run_portfolio_backtest(
                 executor.sell(intent.pair, intent.quantity, prices[intent.pair], use_limit=False)
                 if len(executor.events) > before:
                     executor.events[-1]["fold"] = fold.fold
+                    _add_regime_event_fields(executor.events[-1], cycle.regime)
                     trade_rows.append(executor.events[-1])
 
             for intent in cycle.entries:
@@ -144,9 +175,11 @@ def run_portfolio_backtest(
                 executor.buy(intent.pair, intent.notional_usd, prices[intent.pair], use_limit=False)
                 if len(executor.events) > before:
                     executor.events[-1]["fold"] = fold.fold
+                    _add_regime_event_fields(executor.events[-1], cycle.regime)
                     trade_rows.append(executor.events[-1])
 
             equity_after = portfolio.value(prices)
+            regime_fields = _equity_regime_fields(cycle.regime)
             equity_rows.append(
                 {
                     "fold": fold.fold,
@@ -155,6 +188,7 @@ def run_portfolio_backtest(
                     "equity": equity_after,
                     "cash": portfolio.cash,
                     "positions": len(portfolio.positions),
+                    **regime_fields,
                 }
             )
 
@@ -175,11 +209,14 @@ def run_portfolio_backtest(
             executor.sell(pair, portfolio.positions[pair].quantity, price, use_limit=False)
             if len(executor.events) > before:
                 executor.events[-1]["fold"] = fold.fold
+                _add_regime_event_fields(executor.events[-1], None)
                 trade_rows.append(executor.events[-1])
 
         fold_equity = [row["equity"] for row in equity_rows if row["fold"] == fold.fold]
         metrics = compute_equity_metrics(fold_equity, initial_cash)
         exits = [row for row in trade_rows if row.get("fold") == fold.fold and row["side"] == "SELL"]
+        regime_summary = _fold_regime_summary(equity_rows, fold.fold)
+        trade_summary = _fold_trade_summary(exits)
         fold_rows.append(
             {
                 "fold": fold.fold,
@@ -197,10 +234,12 @@ def run_portfolio_backtest(
                 "closed_trades": len(exits),
                 "win_rate": float(np.mean([row.get("pnl", 0) > 0 for row in exits])) if exits else np.nan,
                 **metrics,
+                **regime_summary,
+                **trade_summary,
             }
         )
 
-    return pd.DataFrame(fold_rows), pd.DataFrame(equity_rows), pd.DataFrame(trade_rows)
+    return _attach_return_over_drawdown(pd.DataFrame(fold_rows)), pd.DataFrame(equity_rows), pd.DataFrame(trade_rows)
 
 
 def write_outputs(
@@ -221,6 +260,89 @@ def write_outputs(
     )
 
 
+def _equity_regime_fields(regime) -> dict[str, object]:
+    if regime is None:
+        return {
+            "regime_stressed": False,
+            "regime_market_roll_impact": np.nan,
+            "regime_threshold": np.nan,
+            "regime_history_bars": 0,
+            "regime_entries_blocked": False,
+            "regime_reason": "",
+        }
+    return {
+        "regime_stressed": regime.is_stressed,
+        "regime_market_roll_impact": regime.market_roll_impact,
+        "regime_threshold": regime.threshold,
+        "regime_history_bars": regime.history_bars,
+        "regime_entries_blocked": regime.entries_blocked,
+        "regime_reason": regime.reason,
+    }
+
+
+def _add_regime_event_fields(event: dict, regime) -> None:
+    fields = _equity_regime_fields(regime)
+    event.update(fields)
+
+
+def _fold_regime_summary(equity_rows: list[dict], fold: int) -> dict[str, float | int]:
+    rows = [row for row in equity_rows if row["fold"] == fold]
+    if not rows:
+        return {
+            "stressed_hours": 0,
+            "stressed_hour_pct": 0.0,
+            "blocked_entry_hours": 0,
+        }
+    stressed = [bool(row.get("regime_stressed")) for row in rows]
+    blocked = [bool(row.get("regime_entries_blocked")) for row in rows]
+    return {
+        "stressed_hours": int(sum(stressed)),
+        "stressed_hour_pct": float(sum(stressed) / len(rows) * 100),
+        "blocked_entry_hours": int(sum(blocked)),
+    }
+
+
+def _fold_trade_summary(exits: list[dict]) -> dict[str, float | int]:
+    stop_exits = [row for row in exits if row.get("reason") == "loss_threshold"]
+    tp_exits = [row for row in exits if row.get("reason") == "gain_threshold"]
+    rank_decay_exits = [row for row in exits if row.get("reason") == "rank_decay"]
+    holding_hours = [_holding_hours(row) for row in exits if row.get("reason") != "fold_end"]
+    holding_hours = [value for value in holding_hours if value is not None]
+    return {
+        "stop_exits": len(stop_exits),
+        "tp_exits": len(tp_exits),
+        "rank_decay_exits": len(rank_decay_exits),
+        "avg_stopped_loss_pct": _mean_pct(row.get("return_pct") for row in stop_exits),
+        "mean_holding_hours": float(np.mean(holding_hours)) if holding_hours else np.nan,
+        "median_holding_hours": float(np.median(holding_hours)) if holding_hours else np.nan,
+    }
+
+
+def _attach_return_over_drawdown(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary.empty or {"total_return_pct", "max_drawdown_pct"} - set(summary.columns):
+        return summary
+    out = summary.copy()
+    out["return_over_max_drawdown"] = np.where(
+        out["max_drawdown_pct"] > 0,
+        out["total_return_pct"] / out["max_drawdown_pct"],
+        np.nan,
+    )
+    return out
+
+
+def _mean_pct(values) -> float:
+    clean = [float(value) for value in values if pd.notna(value)]
+    return float(np.mean(clean) * 100) if clean else np.nan
+
+
+def _holding_hours(row: dict) -> float | None:
+    entry_time = row.get("entry_time")
+    exit_time = row.get("timestamp")
+    if not isinstance(entry_time, int | float) or not isinstance(exit_time, int | float):
+        return None
+    return float(exit_time - entry_time) / 3_600_000
+
+
 def parse_alphas(value: str) -> tuple[float, ...]:
     return tuple(float(part.strip()) for part in value.split(",") if part.strip())
 
@@ -230,6 +352,7 @@ def main() -> int:
     parser.add_argument("--features", default=str(DEFAULT_FEATURE_PATH), help="Feature CSV path")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Output directory")
     parser.add_argument("--prefix", default="ridge_score_portfolio_1h", help="Output filename prefix")
+    parser.add_argument("--pairs", default="all", help="Comma list of pairs to trade, or 'all'")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Ridge model name")
     parser.add_argument("--horizon", type=int, default=DEFAULT_HORIZON)
     parser.add_argument("--is-months", type=int, default=DEFAULT_IS_MONTHS)
@@ -251,11 +374,37 @@ def main() -> int:
     parser.add_argument("--max-positions", type=int, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--max-new-entries", type=int, default=None)
+    parser.add_argument(
+        "--rank-exit-threshold",
+        type=int,
+        default=None,
+        help="Exit held positions whose current score rank is worse than this threshold.",
+    )
+    parser.add_argument(
+        "--regime-throttle",
+        action="store_true",
+        help="Block new entries during high universe-wide roll-impact regimes.",
+    )
+    parser.add_argument("--regime-aggregation", choices=("median", "mean"), default="median")
+    parser.add_argument("--regime-lookback-bars", type=int, default=720)
+    parser.add_argument("--regime-percentile", type=float, default=0.80)
+    parser.add_argument("--regime-min-history-bars", type=int, default=168)
     args = parser.parse_args()
 
     feature_path = Path(args.features)
-    frame = load_model_frame(feature_path, horizon=args.horizon)
+    selected_pairs = parse_pairs(args.pairs)
+    frame = filter_pairs(load_model_frame(feature_path, horizon=args.horizon), selected_pairs)
     ridge_alphas = parse_alphas(args.ridge_alphas)
+    regime_config = (
+        RegimeThrottleConfig(
+            aggregation=args.regime_aggregation,
+            lookback_bars=args.regime_lookback_bars,
+            percentile=args.regime_percentile,
+            min_history_bars=args.regime_min_history_bars,
+        )
+        if args.regime_throttle
+        else None
+    )
     summary, equity, trades = run_portfolio_backtest(
         frame,
         model=args.model,
@@ -274,6 +423,8 @@ def main() -> int:
         max_positions=args.max_positions,
         top_k=args.top_k,
         max_new_entries=args.max_new_entries,
+        regime_config=regime_config,
+        rank_exit_threshold=args.rank_exit_threshold,
     )
     metadata = {
         "feature_path": str(feature_path),
@@ -293,8 +444,16 @@ def main() -> int:
         "max_positions": args.max_positions or max(1, int(np.floor(1 / args.position_fraction))),
         "top_k": args.top_k,
         "max_new_entries": args.max_new_entries,
+        "rank_exit_threshold": args.rank_exit_threshold,
+        "regime_throttle": args.regime_throttle,
+        "regime_aggregation": args.regime_aggregation,
+        "regime_lookback_bars": args.regime_lookback_bars,
+        "regime_percentile": args.regime_percentile,
+        "regime_min_history_bars": args.regime_min_history_bars,
         "rows": int(len(frame)),
         "pairs": int(frame["pair"].nunique()),
+        "pair_filter": list(selected_pairs) if selected_pairs is not None else "all",
+        "pair_universe": sorted(frame["pair"].unique()),
         "start": str(frame["timestamp"].min()),
         "end": str(frame["timestamp"].max()),
     }

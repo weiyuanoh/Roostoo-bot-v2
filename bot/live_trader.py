@@ -39,6 +39,7 @@ from bot.strategy.ridge import (
     latest_scores,
     select_ridge_model,
 )
+from bot.strategy.regime import RegimeThrottleConfig, add_roll_impact_regime
 
 log = get_logger("live_trader")
 
@@ -57,6 +58,7 @@ class RidgeLiveConfig:
     top_k: int | None = LIVE_TOP_K or None
     max_new_entries: int | None = LIVE_MAX_NEW_ENTRIES or None
     max_positions_override: int | None = LIVE_MAX_POSITIONS or None
+    regime_config: RegimeThrottleConfig | None = None
     min_history_bars: int = LIVE_MIN_HISTORY_BARS
     state_path: Path = LIVE_STATE_PATH
 
@@ -165,6 +167,8 @@ class RidgeLiveTrader:
         assert self.selection is not None
         source = candles if candles is not None else self.fetch_history_frame()
         features = build_feature_frame(source)
+        if self.config.regime_config is not None:
+            features = add_roll_impact_regime(features, self.config.regime_config)
         return latest_scores(features, self.selection)
 
     def run_cycle(self, *, execute: bool = False) -> dict[str, Any]:
@@ -195,6 +199,7 @@ class RidgeLiveTrader:
             max_positions=self.config.max_positions,
             top_k=self.config.top_k,
             max_new_entries=self.config.max_new_entries,
+            regime_config=self.config.regime_config,
             take_profit=self.config.take_profit,
             stop_loss=self.config.stop_loss,
         )
@@ -213,6 +218,7 @@ class RidgeLiveTrader:
             "top_k": self.config.top_k,
             "max_new_entries": self.config.max_new_entries,
             "max_positions": self.config.max_positions,
+            "regime": cycle.regime.__dict__ if cycle.regime is not None else None,
             "entries": [intent.__dict__ for intent in entries],
             "exits": [intent.__dict__ for intent in exits],
             "orders": [],
@@ -223,7 +229,18 @@ class RidgeLiveTrader:
             results["orders"].extend(self._execute_entries(entries, price_map))
             self.state.save()
         else:
-            log.info("DRY RUN: %s exits, %s entries", len(exits), len(entries))
+            regime_text = ""
+            if cycle.regime is not None:
+                regime_text = (
+                    " regime_stressed=%s market_roll_impact=%s threshold=%s entries_blocked=%s"
+                    % (
+                        cycle.regime.is_stressed,
+                        cycle.regime.market_roll_impact,
+                        cycle.regime.threshold,
+                        cycle.regime.entries_blocked,
+                    )
+                )
+            log.info("DRY RUN: %s exits, %s entries%s", len(exits), len(entries), regime_text)
 
         log_jsonl("live_cycles.jsonl", results)
         return results

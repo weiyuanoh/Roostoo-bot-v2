@@ -7,3 +7,5 @@ logs/
 data/
 references/
 notebooks/**/*.csv
+reports/backtests/*_equity.csv
+reports/backtests/*_trades.csv

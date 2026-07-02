@@ -2,7 +2,13 @@ import pandas as pd
 import pytest
 
 from bot.backtest.portfolio import Portfolio, compute_equity_metrics
-from bot.backtest.ridge_score_portfolio import run_portfolio_backtest
+from bot.backtest.rank_decay_exit_experiment import (
+    FIXED_TOP30_PAIRS,
+    build_model_frame_for_universe,
+)
+from bot.backtest.ridge_score_portfolio import filter_pairs, run_portfolio_backtest
+from bot.strategy.ridge import DEFAULT_FEATURE_PATH
+from bot.strategy.regime import RegimeThrottleConfig
 
 
 def test_portfolio_buy_sell_updates_cash_and_realized_pnl():
@@ -160,3 +166,211 @@ def test_ridge_portfolio_backtest_respects_top_k_and_max_new_entries():
     assert buys["pair"].nunique() == 1
     assert buys["pair"].iloc[0] == "P7/USD"
     assert equity["positions"].max() == 1
+
+
+def test_ridge_portfolio_backtest_supports_rank_decay_exit():
+    rows = []
+    timestamps = pd.date_range("2025-01-01", periods=24 * 62, freq="h", tz="UTC")
+    pairs = [f"P{idx}/USD" for idx in range(8)]
+    os_start = pd.Timestamp("2025-02-01", tz="UTC")
+    for timestamp in timestamps:
+        for p_idx, pair in enumerate(pairs):
+            score = float(p_idx)
+            if pair == "P7/USD" and timestamp >= os_start + pd.Timedelta(hours=2):
+                score = -1.0
+            rows.append(
+                {
+                    "open_time": int(timestamp.timestamp() * 1000),
+                    "timestamp": timestamp,
+                    "pair": pair,
+                    "close": 100.0 + p_idx,
+                    "target_z": float(p_idx),
+                    "z_momentum": score,
+                    "z_low_roll_impact": 0.0,
+                    "z_momentum_x_low_roll_impact": 0.0,
+                    "forward_return_1": float(p_idx),
+                }
+            )
+    frame = pd.DataFrame(rows)
+
+    summary, _, trades = run_portfolio_backtest(
+        frame,
+        model="momentum_only",
+        horizon=1,
+        is_months=1,
+        os_months=1,
+        step_months=1,
+        ridge_alphas=(1.0,),
+        initial_cash=10_000.0,
+        position_fraction=0.25,
+        take_profit=10.0,
+        stop_loss=10.0,
+        fee_bps=0.0,
+        max_positions=1,
+        top_k=1,
+        max_new_entries=1,
+        rank_exit_threshold=2,
+    )
+
+    assert "rank_decay" in set(trades["reason"])
+    assert summary["rank_decay_exits"].iloc[0] >= 1
+
+
+def test_ridge_portfolio_backtest_baseline_has_no_rank_decay_exit():
+    rows = []
+    timestamps = pd.date_range("2025-01-01", periods=24 * 62, freq="h", tz="UTC")
+    pairs = [f"P{idx}/USD" for idx in range(8)]
+    os_start = pd.Timestamp("2025-02-01", tz="UTC")
+    for timestamp in timestamps:
+        for p_idx, pair in enumerate(pairs):
+            score = float(p_idx)
+            if pair == "P7/USD" and timestamp >= os_start + pd.Timedelta(hours=2):
+                score = -1.0
+            rows.append(
+                {
+                    "open_time": int(timestamp.timestamp() * 1000),
+                    "timestamp": timestamp,
+                    "pair": pair,
+                    "close": 100.0 + p_idx,
+                    "target_z": float(p_idx),
+                    "z_momentum": score,
+                    "z_low_roll_impact": 0.0,
+                    "z_momentum_x_low_roll_impact": 0.0,
+                    "forward_return_1": float(p_idx),
+                }
+            )
+    frame = pd.DataFrame(rows)
+
+    summary, _, trades = run_portfolio_backtest(
+        frame,
+        model="momentum_only",
+        horizon=1,
+        is_months=1,
+        os_months=1,
+        step_months=1,
+        ridge_alphas=(1.0,),
+        initial_cash=10_000.0,
+        position_fraction=0.25,
+        take_profit=10.0,
+        stop_loss=10.0,
+        fee_bps=0.0,
+        max_positions=1,
+        top_k=1,
+        max_new_entries=1,
+        rank_exit_threshold=None,
+    )
+
+    assert "rank_decay" not in set(trades["reason"])
+    assert summary["rank_decay_exits"].iloc[0] == 0
+
+
+def test_rank_decay_experiment_default_universe_has_30_pairs():
+    assert len(FIXED_TOP30_PAIRS) == 30
+    assert len(set(FIXED_TOP30_PAIRS)) == 30
+
+
+def test_rank_decay_experiment_fixed_pairs_exist_in_feature_frame():
+    frame = pd.read_csv(DEFAULT_FEATURE_PATH, usecols=["pair"])
+
+    assert set(FIXED_TOP30_PAIRS) <= set(frame["pair"].unique())
+
+
+def test_rank_decay_experiment_model_frame_recomputes_zscores_after_filtering(tmp_path):
+    timestamp = pd.Timestamp("2026-01-01", tz="UTC")
+    raw = pd.DataFrame(
+        [
+            {
+                "open_time": int(timestamp.timestamp() * 1000),
+                "pair": "BTC/USD",
+                "close": 100.0,
+                "vol_adj_momentum_24": 100.0,
+                "roll_impact": 1.0,
+            },
+            {
+                "open_time": int(timestamp.timestamp() * 1000),
+                "pair": "ETH/USD",
+                "close": 101.0,
+                "vol_adj_momentum_24": 200.0,
+                "roll_impact": 2.0,
+            },
+            {
+                "open_time": int(timestamp.timestamp() * 1000),
+                "pair": "SOL/USD",
+                "close": 102.0,
+                "vol_adj_momentum_24": 10_000.0,
+                "roll_impact": 3.0,
+            },
+        ]
+    )
+    feature_path = tmp_path / "features.csv"
+    raw.to_csv(feature_path, index=False)
+
+    frame = build_model_frame_for_universe(feature_path, ("BTC/USD", "ETH/USD"), horizon=1)
+    zscores = frame.set_index("pair")["z_momentum"]
+
+    assert set(frame["pair"]) == {"BTC/USD", "ETH/USD"}
+    assert zscores["BTC/USD"] == pytest.approx(-0.70710678)
+    assert zscores["ETH/USD"] == pytest.approx(0.70710678)
+
+
+def test_backtest_pair_filter_limits_trade_universe():
+    frame = pd.DataFrame(
+        {
+            "pair": ["BTC/USD", "ETH/USD", "SOL/USD"],
+            "close": [100.0, 200.0, 300.0],
+        }
+    )
+
+    filtered = filter_pairs(frame, ("BTC/USD", "SOL/USD"))
+
+    assert set(filtered["pair"]) == {"BTC/USD", "SOL/USD"}
+
+
+def test_ridge_portfolio_backtest_regime_throttle_blocks_buys_on_stress():
+    rows = []
+    timestamps = pd.date_range("2025-01-01", periods=24 * 62, freq="h", tz="UTC")
+    pairs = [f"P{idx}/USD" for idx in range(8)]
+    os_start = pd.Timestamp("2025-02-01", tz="UTC")
+    for timestamp in timestamps:
+        roll_impact = 100.0 if timestamp >= os_start else 1.0
+        for p_idx, pair in enumerate(pairs):
+            rows.append(
+                {
+                    "open_time": int(timestamp.timestamp() * 1000),
+                    "timestamp": timestamp,
+                    "pair": pair,
+                    "close": 100.0 + p_idx,
+                    "roll_impact": roll_impact,
+                    "target_z": float(p_idx),
+                    "z_momentum": float(p_idx),
+                    "z_low_roll_impact": 0.0,
+                    "z_momentum_x_low_roll_impact": 0.0,
+                    "forward_return_1": float(p_idx),
+                }
+            )
+    frame = pd.DataFrame(rows)
+
+    summary, equity, trades = run_portfolio_backtest(
+        frame,
+        model="momentum_only",
+        horizon=1,
+        is_months=1,
+        os_months=1,
+        step_months=1,
+        ridge_alphas=(1.0,),
+        initial_cash=10_000.0,
+        position_fraction=0.25,
+        take_profit=10.0,
+        stop_loss=10.0,
+        fee_bps=0.0,
+        max_positions=3,
+        top_k=1,
+        max_new_entries=1,
+        regime_config=RegimeThrottleConfig(lookback_bars=24, percentile=0.8, min_history_bars=24),
+    )
+
+    assert "regime_stressed" in equity.columns
+    assert "stressed_hours" in summary.columns
+    assert equity["regime_stressed"].any()
+    assert summary["blocked_entry_hours"].iloc[0] > 0
+    assert trades.empty or not trades["side"].eq("BUY").any()

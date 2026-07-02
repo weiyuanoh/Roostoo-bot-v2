@@ -2,7 +2,14 @@ import pandas as pd
 import pytest
 
 from bot.backtest.portfolio import Position
-from bot.strategy.ridge import add_training_target, build_cycle_intents, entry_intents, exit_intent
+from bot.strategy.ridge import (
+    add_training_target,
+    build_cycle_intents,
+    entry_intents,
+    exit_intent,
+    score_ranks,
+)
+from bot.strategy.regime import RegimeThrottleConfig
 
 
 def test_add_training_target_adds_forward_return_and_target_z():
@@ -171,3 +178,138 @@ def test_build_cycle_intents_keeps_exiting_pair_held_for_same_cycle_entries():
 
     assert [intent.pair for intent in cycle.exits] == ["BTC/USD"]
     assert [intent.pair for intent in cycle.entries] == ["ETH/USD"]
+
+
+def test_score_ranks_orders_scores_descending():
+    scores = pd.DataFrame(
+        [
+            {"pair": "BTC/USD", "ridge_score": 0.1},
+            {"pair": "ETH/USD", "ridge_score": 0.5},
+            {"pair": "SOL/USD", "ridge_score": 0.3},
+        ]
+    )
+
+    assert score_ranks(scores) == {"ETH/USD": 1, "SOL/USD": 2, "BTC/USD": 3}
+
+
+def test_build_cycle_intents_exits_when_held_pair_rank_decays_below_threshold():
+    scores = pd.DataFrame(
+        [
+            {"pair": "BTC/USD", "ridge_score": 1.0, "close": 100.0},
+            {"pair": "ETH/USD", "ridge_score": 0.9, "close": 50.0},
+            {"pair": "SOL/USD", "ridge_score": 0.8, "close": 10.0},
+        ]
+    )
+    positions = {
+        "SOL/USD": Position(
+            pair="SOL/USD",
+            quantity=10.0,
+            entry_price=10.0,
+            entry_time=1,
+            entry_value=100.0,
+            entry_score=1.0,
+        )
+    }
+
+    cycle = build_cycle_intents(
+        scores,
+        positions,
+        {"BTC/USD": 100.0, "ETH/USD": 50.0, "SOL/USD": 10.0},
+        portfolio_value=1_000.0,
+        available_cash=1_000.0,
+        position_fraction=0.5,
+        max_positions=2,
+        rank_exit_threshold=2,
+        take_profit=10.0,
+        stop_loss=10.0,
+    )
+
+    assert [intent.pair for intent in cycle.exits] == ["SOL/USD"]
+    assert cycle.exits[0].reason == "rank_decay"
+    assert [intent.pair for intent in cycle.entries] == ["BTC/USD"]
+
+
+def test_build_cycle_intents_blocks_entries_but_keeps_exits_during_stress():
+    scores = pd.DataFrame(
+        [
+            {
+                "pair": "BTC/USD",
+                "ridge_score": 10.0,
+                "close": 150.0,
+                "market_roll_impact": 5.0,
+                "market_roll_impact_threshold": 4.0,
+                "market_roll_history_bars": 10,
+                "market_roll_stressed": True,
+            },
+            {
+                "pair": "ETH/USD",
+                "ridge_score": 9.0,
+                "close": 50.0,
+                "market_roll_impact": 5.0,
+                "market_roll_impact_threshold": 4.0,
+                "market_roll_history_bars": 10,
+                "market_roll_stressed": True,
+            },
+        ]
+    )
+    positions = {
+        "BTC/USD": Position(
+            pair="BTC/USD",
+            quantity=1.0,
+            entry_price=100.0,
+            entry_time=1,
+            entry_value=100.0,
+            entry_score=1.0,
+        )
+    }
+
+    cycle = build_cycle_intents(
+        scores,
+        positions,
+        {"BTC/USD": 150.0, "ETH/USD": 50.0},
+        portfolio_value=1_000.0,
+        available_cash=1_000.0,
+        position_fraction=0.5,
+        max_positions=2,
+        regime_config=RegimeThrottleConfig(lookback_bars=10, min_history_bars=10),
+        take_profit=0.5,
+        stop_loss=0.2,
+    )
+
+    assert [intent.pair for intent in cycle.exits] == ["BTC/USD"]
+    assert cycle.entries == []
+    assert cycle.regime is not None
+    assert cycle.regime.entries_blocked
+
+
+def test_build_cycle_intents_preserves_entries_when_regime_is_not_stressed():
+    scores = pd.DataFrame(
+        [
+            {
+                "pair": "ETH/USD",
+                "ridge_score": 9.0,
+                "close": 50.0,
+                "market_roll_impact": 3.0,
+                "market_roll_impact_threshold": 4.0,
+                "market_roll_history_bars": 10,
+                "market_roll_stressed": False,
+            },
+        ]
+    )
+
+    cycle = build_cycle_intents(
+        scores,
+        {},
+        {"ETH/USD": 50.0},
+        portfolio_value=1_000.0,
+        available_cash=1_000.0,
+        position_fraction=0.5,
+        max_positions=2,
+        regime_config=RegimeThrottleConfig(lookback_bars=10, min_history_bars=10),
+        take_profit=0.5,
+        stop_loss=0.2,
+    )
+
+    assert [intent.pair for intent in cycle.entries] == ["ETH/USD"]
+    assert cycle.regime is not None
+    assert not cycle.regime.is_stressed

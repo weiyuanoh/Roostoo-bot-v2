@@ -30,6 +30,7 @@ from bot.live_trader import RidgeLiveConfig, RidgeLiveTrader
 from bot.liquidate import liquidate_positions
 from bot.roostoo_client import RoostooClient
 from bot.scheduler import next_hour_boundary, sleep_until
+from bot.strategy.regime import RegimeThrottleConfig
 
 
 def parse_pairs(raw: str | None) -> list[str]:
@@ -113,6 +114,7 @@ def _live_config(args: argparse.Namespace) -> RidgeLiveConfig:
         top_k=_positive_or_none(args.top_k),
         max_new_entries=_positive_or_none(args.max_new_entries),
         max_positions_override=_positive_or_none(args.max_positions),
+        regime_config=_regime_config(args),
         state_path=Path(args.state_path),
     )
 
@@ -121,6 +123,17 @@ def _positive_or_none(value: int | None) -> int | None:
     if value is None or value <= 0:
         return None
     return value
+
+
+def _regime_config(args: argparse.Namespace) -> RegimeThrottleConfig | None:
+    if not args.regime_throttle:
+        return None
+    return RegimeThrottleConfig(
+        aggregation=args.regime_aggregation,
+        lookback_bars=args.regime_lookback_bars,
+        percentile=args.regime_percentile,
+        min_history_bars=args.regime_min_history_bars,
+    )
 
 
 def live_once(args: argparse.Namespace) -> int:
@@ -137,11 +150,12 @@ def live_once(args: argparse.Namespace) -> int:
         return 1
     print(
         "execute={execute} portfolio_value={portfolio_value:.2f} "
-        "exits={exits} entries={entries}".format(
+        "exits={exits} entries={entries}{regime}".format(
             execute=result["execute"],
             portfolio_value=result["portfolio_value"],
             exits=len(result["exits"]),
             entries=len(result["entries"]),
+            regime=_format_regime(result.get("regime")),
         )
     )
     return 0
@@ -181,14 +195,24 @@ def live_loop(args: argparse.Namespace) -> int:
             continue
         print(
             "cycle execute={execute} portfolio_value={portfolio_value:.2f} "
-            "exits={exits} entries={entries}".format(
+            "exits={exits} entries={entries}{regime}".format(
                 execute=result["execute"],
                 portfolio_value=result["portfolio_value"],
                 exits=len(result["exits"]),
                 entries=len(result["entries"]),
+                regime=_format_regime(result.get("regime")),
             )
         )
     return 0
+
+
+def _format_regime(regime: dict | None) -> str:
+    if not regime:
+        return ""
+    return (
+        " regime_stressed={is_stressed} market_roll_impact={market_roll_impact} "
+        "threshold={threshold} entries_blocked={entries_blocked}"
+    ).format(**regime)
 
 
 def add_live_args(parser: argparse.ArgumentParser) -> None:
@@ -214,6 +238,15 @@ def add_live_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--tp", type=float, default=LIVE_TAKE_PROFIT, help="Take-profit return, e.g. 0.5")
     parser.add_argument("--sl", type=float, default=LIVE_STOP_LOSS, help="Stop-loss return, e.g. 0.2")
+    parser.add_argument(
+        "--regime-throttle",
+        action="store_true",
+        help="Block new entries during high universe-wide roll-impact regimes.",
+    )
+    parser.add_argument("--regime-aggregation", choices=("median", "mean"), default="median")
+    parser.add_argument("--regime-lookback-bars", type=int, default=720)
+    parser.add_argument("--regime-percentile", type=float, default=0.80)
+    parser.add_argument("--regime-min-history-bars", type=int, default=168)
     parser.add_argument(
         "--exit-threshold",
         type=float,

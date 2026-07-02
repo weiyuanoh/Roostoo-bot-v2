@@ -16,6 +16,7 @@ import pandas as pd
 from bot.features import add_alpha_features
 from bot.forward_ic import add_forward_return, information_coefficient
 from bot.microstructure import compute_microstructure_measures
+from bot.strategy.regime import RegimeDecision, RegimeThrottleConfig, decide_regime_throttle
 
 
 DEFAULT_FEATURE_PATH = Path("notebooks/microstructure/momentum_roll_impact_is_os_1h_features_8m.csv")
@@ -90,6 +91,7 @@ class TradeIntent:
 class CycleIntents:
     exits: list[TradeIntent]
     entries: list[TradeIntent]
+    regime: RegimeDecision | None = None
 
 
 def model_terms(model_name: str) -> tuple[str, ...]:
@@ -481,6 +483,36 @@ def exit_intent(
     return None
 
 
+def rank_decay_exit_intent(
+    pair: str,
+    quantity: float,
+    current_price: float,
+    rank: int | None,
+    *,
+    rank_exit_threshold: int,
+) -> TradeIntent | None:
+    if quantity <= 0 or current_price <= 0:
+        return None
+    if rank is None or rank > rank_exit_threshold:
+        return TradeIntent(
+            pair=pair,
+            side="SELL",
+            quantity=quantity,
+            reason="rank_decay",
+            price=current_price,
+        )
+    return None
+
+
+def score_ranks(
+    scores: pd.DataFrame,
+    *,
+    score_col: str = "ridge_score",
+) -> dict[str, int]:
+    ranked = scores.dropna(subset=[score_col]).sort_values(score_col, ascending=False)
+    return {str(row.pair): idx for idx, row in enumerate(ranked.itertuples(index=False), start=1)}
+
+
 def build_cycle_intents(
     scores: pd.DataFrame,
     positions: dict[str, Any],
@@ -492,16 +524,30 @@ def build_cycle_intents(
     max_positions: int,
     top_k: int | None = None,
     max_new_entries: int | None = None,
+    regime_config: RegimeThrottleConfig | None = None,
+    rank_exit_threshold: int | None = None,
     take_profit: float,
     stop_loss: float,
 ) -> CycleIntents:
     """Build live-style exit and entry intents without mutating portfolio state."""
     held_pairs = set(positions)
     exits = []
+    ranks = score_ranks(scores) if rank_exit_threshold is not None else {}
     for pair, position in positions.items():
         current_price = price_map.get(pair)
         if current_price is None:
             continue
+        if rank_exit_threshold is not None:
+            intent = rank_decay_exit_intent(
+                pair,
+                float(getattr(position, "quantity")),
+                current_price,
+                ranks.get(pair),
+                rank_exit_threshold=rank_exit_threshold,
+            )
+            if intent:
+                exits.append(intent)
+                continue
         intent = exit_intent(
             pair,
             float(getattr(position, "quantity")),
@@ -513,6 +559,9 @@ def build_cycle_intents(
         if intent:
             exits.append(intent)
 
+    regime = decide_regime_throttle(scores, regime_config) if regime_config is not None else None
+    effective_max_new_entries = 0 if regime and regime.entries_blocked else max_new_entries
+
     entries = entry_intents(
         scores,
         held_pairs,
@@ -521,7 +570,7 @@ def build_cycle_intents(
         position_fraction=position_fraction,
         max_positions=max_positions,
         top_k=top_k,
-        max_new_entries=max_new_entries,
+        max_new_entries=effective_max_new_entries,
     )
     entries = [intent for intent in entries if intent.pair in price_map]
-    return CycleIntents(exits=exits, entries=entries)
+    return CycleIntents(exits=exits, entries=entries, regime=regime)
