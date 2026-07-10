@@ -28,6 +28,17 @@ from bot.config import (
 from bot.data_store import CandleStore
 from bot.live_trader import RidgeLiveConfig, RidgeLiveTrader
 from bot.liquidate import liquidate_positions
+from bot.live_state import LiveState
+from bot.monitoring import (
+    default_output_dir,
+    forward_report,
+    health_report,
+    positions_rows,
+    summary_reports,
+    write_forward_report,
+    write_health_report,
+    write_summary_reports,
+)
 from bot.roostoo_client import RoostooClient
 from bot.scheduler import next_hour_boundary, sleep_until
 from bot.strategy.regime import RegimeThrottleConfig
@@ -292,6 +303,98 @@ def liquidate(args: argparse.Namespace) -> int:
     return 0
 
 
+def positions(args: argparse.Namespace) -> int:
+    roostoo = RoostooClient()
+    wallet = roostoo.balance()
+    if wallet is None:
+        print("Balance unavailable. Check Roostoo connectivity/credentials.")
+        return 1
+    ticker = roostoo.ticker() or {}
+    prices = {
+        pair: float(data.get("LastPrice", 0) or 0)
+        for pair, data in ticker.items()
+        if isinstance(data, dict) and float(data.get("LastPrice", 0) or 0) > 0
+    }
+    state = LiveState(args.state_path)
+    rows = positions_rows(wallet, state, prices=prices, pairs=parse_pairs(args.pairs))
+    if not rows:
+        print("No positions.")
+        return 0
+    for row in rows:
+        ret = row["return_pct"]
+        ret_text = "n/a" if ret is None else f"{ret * 100:.2f}%"
+        print(
+            "{pair}: wallet_qty={wallet_quantity:.12g} state_qty={state_quantity:.12g} "
+            "price={price} value={market_value} entry={entry_price} return={ret}".format(
+                pair=row["pair"],
+                wallet_quantity=row["wallet_quantity"],
+                state_quantity=row["state_quantity"],
+                price=_fmt_optional(row["price"]),
+                market_value=_fmt_optional(row["market_value"]),
+                entry_price=_fmt_optional(row["entry_price"]),
+                ret=ret_text,
+            )
+        )
+        if row["missing_entry_metadata"] or row["state_only"] or row["wallet_only"]:
+            print(
+                "  flags: missing_entry_metadata={missing} state_only={state_only} wallet_only={wallet_only}".format(
+                    missing=row["missing_entry_metadata"],
+                    state_only=row["state_only"],
+                    wallet_only=row["wallet_only"],
+                )
+            )
+    return 0
+
+
+def monitor_health(args: argparse.Namespace) -> int:
+    wallet = RoostooClient().balance()
+    state = LiveState(args.state_path)
+    report = health_report(
+        wallet=wallet,
+        state=state,
+        pairs=parse_pairs(args.pairs),
+        max_cycle_age_minutes=args.max_cycle_age_minutes,
+    )
+    path = write_health_report(report, Path(args.output_dir))
+    print(f"status={report['status']} issues={len(report['issues'])} -> {path}")
+    for issue in report["issues"]:
+        print(f"{issue['severity']}: {issue['message']}")
+    return 0 if report["status"] != "critical" else 1
+
+
+def monitor_summary(args: argparse.Namespace) -> int:
+    reports = summary_reports(since_hours=args.since_hours)
+    paths = write_summary_reports(reports, Path(args.output_dir))
+    summary = reports["summary"]
+    if not summary.empty:
+        row = summary.iloc[0].to_dict()
+        print(
+            "cycles={cycles} orders={orders} closed_trades={closed_trades} "
+            "mean_slippage_bps={mean_slippage_bps} gross_pnl={gross_pnl}".format(**row)
+        )
+    for path in paths:
+        print(path)
+    return 0
+
+
+def monitor_forward(args: argparse.Namespace) -> int:
+    horizons = tuple(int(item.strip()) for item in args.horizons.split(",") if item.strip())
+    frame = forward_report(since_hours=args.since_hours, horizons=horizons)
+    path = write_forward_report(frame, Path(args.output_dir))
+    print(frame.to_string(index=False) if not frame.empty else "No forward observations.")
+    print(path)
+    return 0
+
+
+def _fmt_optional(value) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.8g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Roostoo bot utilities")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -326,6 +429,25 @@ def main() -> int:
         help="Place market sell orders. Omit for dry-run planning only.",
     )
 
+    positions_parser = subparsers.add_parser("positions", help="Show wallet merged with local live state")
+    positions_parser.add_argument("--pairs", default="all", help="Comma list or 'all'")
+    positions_parser.add_argument("--state-path", default=str(LIVE_STATE_PATH))
+
+    health_parser = subparsers.add_parser("monitor-health", help="Write local live health report")
+    health_parser.add_argument("--pairs", default="all", help="Comma list or 'all'")
+    health_parser.add_argument("--state-path", default=str(LIVE_STATE_PATH))
+    health_parser.add_argument("--output-dir", default=str(default_output_dir()))
+    health_parser.add_argument("--max-cycle-age-minutes", type=int, default=90)
+
+    summary_parser = subparsers.add_parser("monitor-summary", help="Write local live attribution reports")
+    summary_parser.add_argument("--since-hours", type=int, default=168)
+    summary_parser.add_argument("--output-dir", default=str(default_output_dir()))
+
+    forward_parser = subparsers.add_parser("monitor-forward", help="Write score-vs-forward-return report")
+    forward_parser.add_argument("--since-hours", type=int, default=720)
+    forward_parser.add_argument("--horizons", default="1,6,24")
+    forward_parser.add_argument("--output-dir", default=str(default_output_dir()))
+
     args = parser.parse_args()
     if args.command == "smoke":
         return smoke()
@@ -348,6 +470,14 @@ def main() -> int:
         return live_loop(args)
     if args.command == "liquidate":
         return liquidate(args)
+    if args.command == "positions":
+        return positions(args)
+    if args.command == "monitor-health":
+        return monitor_health(args)
+    if args.command == "monitor-summary":
+        return monitor_summary(args)
+    if args.command == "monitor-forward":
+        return monitor_forward(args)
     raise AssertionError(f"unhandled command {args.command}")
 
 

@@ -144,6 +144,8 @@ bot/live_trader.py
 bot/main.py
 bot/live_state.py
 bot/executor.py
+bot/telemetry.py
+bot/monitoring.py
 ```
 
 Live behavior:
@@ -155,6 +157,7 @@ Live behavior:
 - long-only spot
 - local state file stores entry price, entry score, quantity, and order id
 - exits happen only through TP/SL unless manual liquidation is requested
+- every cycle logs score snapshots and order attribution for local monitoring
 
 Local live state:
 
@@ -163,6 +166,56 @@ data/live_state.json
 ```
 
 This file is intentionally ignored by git.
+
+Live cycle flow:
+
+```text
+1. Fetch recent Binance 1h candles for the configured pair universe.
+2. Compute microstructure, alpha, and ridge score features.
+3. Train the selected ridge model on recent history.
+4. Fetch Roostoo wallet balances and ticker prices.
+5. Reconcile local live state against the Roostoo wallet.
+6. Build exit and entry intents with the shared strategy logic.
+7. Log the full score/rank snapshot for the cycle.
+8. If dry-run, log intents only and place no orders.
+9. If --execute, place market sell exits first, then market buy entries.
+10. Update local live state after successful orders.
+11. Write cycle, score, order, closed-trade, and monitor logs.
+```
+
+### Live Monitoring
+
+Local monitoring is implemented in:
+
+```text
+bot/telemetry.py
+bot/monitoring.py
+```
+
+Monitoring is self-contained and file-based. It does not change trading
+decisions. The event format is structured so Telegram or another alert
+transport can be added later without changing the live-trading telemetry.
+
+Raw monitoring logs:
+
+```text
+logs/live_cycles.jsonl      cycle-level portfolio, config, intents, and orders
+logs/live_scores.jsonl      per-pair score/rank snapshots for each cycle
+logs/trades.jsonl           order/fill telemetry and realized slippage
+logs/closed_trades.jsonl    closed-trade attribution for successful exits
+logs/monitor_events.jsonl   health/risk findings, local-only for now
+```
+
+Generated monitoring reports:
+
+```text
+reports/live_monitoring/summary.csv
+reports/live_monitoring/pair_attribution.csv
+reports/live_monitoring/exit_reason_attribution.csv
+reports/live_monitoring/slippage.csv
+reports/live_monitoring/forward_ic.csv
+reports/live_monitoring/health.json
+```
 
 ### Backtest Infrastructure
 
@@ -188,6 +241,22 @@ Known remaining mismatch:
 - backtest fills against candle prices
 - live fills against Roostoo market liquidity at runtime
 - spread and realized market-order slippage are approximated only with `--slippage-bps`
+
+Backtest flow:
+
+```text
+1. Load the feature CSV, usually notebooks/microstructure/momentum_roll_impact_is_os_1h_features_8m.csv.
+2. Recompute ridge signal columns and forward-return targets.
+3. Filter to the requested pair universe.
+4. Build rolling IS/OS folds.
+5. For each fold, train ridge on the IS window and score the OS window.
+6. Step through OS candles one hourly bar at a time.
+7. Mark current portfolio value from candle close prices.
+8. Build exit and entry intents with the same shared strategy logic used live.
+9. Simulate sells first, then buys, using Roostoo-like precision/min-order rules.
+10. Apply configured fees and slippage.
+11. Record equity, trades, closed-trade reasons, pair attribution, and fold summary.
+```
 
 ## Setup
 
@@ -349,6 +418,15 @@ Run the generic live-like portfolio backtest manually:
   --slippage-bps 5
 ```
 
+The generic backtest writes:
+
+```text
+<prefix>_summary.csv
+<prefix>_equity.csv
+<prefix>_trades.csv
+<prefix>_metadata.json
+```
+
 ## Operational Notes
 
 For live testing, use `tmux` so the bot keeps running if the terminal disconnects:
@@ -362,6 +440,7 @@ Monitor logs:
 ```bash
 tail -f logs/live_cycles.jsonl
 tail -f logs/trades.jsonl
+tail -f logs/closed_trades.jsonl
 ```
 
 Check wallet:
@@ -370,10 +449,31 @@ Check wallet:
 .venv/bin/python -m bot.main balance
 ```
 
-Check local state:
+Check merged wallet and local state:
+
+```bash
+.venv/bin/python -m bot.main positions --pairs "$PAIRS"
+```
+
+Check raw local state:
 
 ```bash
 cat data/live_state.json
+```
+
+Generate local monitoring reports:
+
+```bash
+.venv/bin/python -m bot.main monitor-health --pairs "$PAIRS"
+
+.venv/bin/python -m bot.main monitor-summary \
+  --since-hours 168 \
+  --output-dir reports/live_monitoring
+
+.venv/bin/python -m bot.main monitor-forward \
+  --since-hours 720 \
+  --horizons 1,6,24 \
+  --output-dir reports/live_monitoring
 ```
 
 ## Tests
@@ -398,18 +498,19 @@ Current coverage includes:
 - simulated executor behavior
 - portfolio backtest behavior
 - liquidation planning
+- live telemetry and monitoring reports
 
 ## Next Work
 
-Research is paused. Deployment and operations are now the priority:
+Research is paused. Deployment, operations, and live diagnostics are now the priority:
 
 1. Run the deployment baseline in dry-run mode and inspect `logs/live_cycles.jsonl`.
 2. Confirm Roostoo balances, minimum order handling, and local `data/live_state.json`.
 3. Execute one live cycle, then verify orders and local state reconciliation.
 4. Move production operation from raw terminal / tmux to `systemd` or another process manager.
-5. Add a `positions` command that merges Roostoo wallet data with local entry metadata.
-6. Add live-vs-backtest monitoring for fills, slippage, stop hits, and pair attribution.
-7. Resume research only after live operation is stable.
+5. Review `monitor-summary` and `monitor-forward` after enough live cycles accumulate.
+6. Add Telegram delivery for high-severity `monitor_events.jsonl` findings.
+7. Resume research only after live operation and attribution are stable.
 
 The core principle going forward is:
 

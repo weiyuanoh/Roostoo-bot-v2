@@ -30,6 +30,14 @@ from bot.executor import Executor
 from bot.live_state import LivePositionState, LiveState
 from bot.logger import get_logger, log_jsonl
 from bot.roostoo_client import RoostooClient
+from bot.telemetry import (
+    closed_trade_record,
+    log_closed_trade,
+    log_order_telemetry,
+    log_score_snapshot,
+    order_telemetry_record,
+    stable_id,
+)
 from bot.strategy.ridge import (
     DEFAULT_RIDGE_ALPHAS,
     RidgeSelection,
@@ -37,6 +45,7 @@ from bot.strategy.ridge import (
     build_cycle_intents,
     build_feature_frame,
     latest_scores,
+    score_ranks,
     select_ridge_model,
 )
 from bot.strategy.regime import RegimeThrottleConfig, add_roll_impact_regime
@@ -188,6 +197,9 @@ class RidgeLiveTrader:
         price_map = live_price_map(ticker, scores)
         portfolio_value = compute_portfolio_value(wallet, price_map)
         available_cash = wallet_usd_cash(wallet)
+        cycle_timestamp = datetime.now(timezone.utc).isoformat()
+        latest_open_time = _latest_open_time(scores)
+        cycle_id = stable_id(cycle_timestamp, latest_open_time, self.config.model, execute)
 
         cycle = build_cycle_intents(
             scores,
@@ -205,9 +217,32 @@ class RidgeLiveTrader:
         )
         exits = cycle.exits
         entries = cycle.entries
+        ranks = score_ranks(scores)
+        strategy_params = {
+            "take_profit": self.config.take_profit,
+            "stop_loss": self.config.stop_loss,
+            "top_k": self.config.top_k,
+            "max_new_entries": self.config.max_new_entries,
+            "max_positions": self.config.max_positions,
+            "position_fraction": self.config.position_fraction,
+            "execute": execute,
+        }
+        log_score_snapshot(
+            cycle_id=cycle_id,
+            scores=scores,
+            price_map=price_map,
+            held_pairs=set(self.state.positions),
+            entry_pairs={intent.pair for intent in entries},
+            exit_pairs={intent.pair for intent in exits},
+            model=self.selection.model if self.selection else self.config.model,
+            alpha=self.selection.alpha if self.selection else None,
+            strategy_params=strategy_params,
+        )
 
         results = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": cycle_timestamp,
+            "cycle_id": cycle_id,
+            "latest_open_time": latest_open_time,
             "execute": execute,
             "portfolio_value": portfolio_value,
             "available_cash": available_cash,
@@ -225,8 +260,8 @@ class RidgeLiveTrader:
         }
 
         if execute:
-            results["orders"].extend(self._execute_exits(exits, price_map))
-            results["orders"].extend(self._execute_entries(entries, price_map))
+            results["orders"].extend(self._execute_exits(exits, price_map, cycle_id, ranks))
+            results["orders"].extend(self._execute_entries(entries, price_map, cycle_id))
             self.state.save()
         else:
             regime_text = ""
@@ -245,22 +280,54 @@ class RidgeLiveTrader:
         log_jsonl("live_cycles.jsonl", results)
         return results
 
-    def _execute_exits(self, intents, price_map: dict[str, float]) -> list[dict[str, Any]]:
+    def _execute_exits(
+        self,
+        intents,
+        price_map: dict[str, float],
+        cycle_id: str,
+        ranks: dict[str, int],
+    ) -> list[dict[str, Any]]:
         orders = []
         for intent in intents:
             price = price_map[intent.pair]
+            position = self.state.positions.get(intent.pair)
             result = self.executor.sell(intent.pair, intent.quantity, price, use_limit=False)
-            orders.append({"intent": intent.__dict__, "result": result})
+            telemetry = order_telemetry_record(
+                cycle_id=cycle_id,
+                intent=intent,
+                result=result,
+                reference_price=price,
+            )
+            log_order_telemetry(telemetry)
+            log_closed_trade(
+                closed_trade_record(
+                    cycle_id=cycle_id,
+                    position=position,
+                    intent=intent,
+                    order_record=telemetry,
+                    latest_rank=ranks.get(intent.pair),
+                )
+                if position is not None
+                else None
+            )
+            orders.append({"intent": intent.__dict__, "result": result, "telemetry": telemetry})
             if result and result.get("Success"):
                 self.state.remove_position(intent.pair)
         return orders
 
-    def _execute_entries(self, intents, price_map: dict[str, float]) -> list[dict[str, Any]]:
+    def _execute_entries(self, intents, price_map: dict[str, float], cycle_id: str) -> list[dict[str, Any]]:
         orders = []
         for intent in intents:
             price = price_map[intent.pair]
             result = self.executor.buy(intent.pair, intent.notional_usd, price, use_limit=False)
-            orders.append({"intent": intent.__dict__, "result": result})
+            telemetry = order_telemetry_record(
+                cycle_id=cycle_id,
+                intent=intent,
+                result=result,
+                reference_price=price,
+            )
+            log_order_telemetry(telemetry)
+            orders.append({"intent": intent.__dict__, "result": result, "telemetry": telemetry})
             if result and result.get("Success"):
                 quantity, avg_price, order_id = order_fill_details(
                     result,
@@ -335,3 +402,14 @@ def order_fill_details(
         avg_price = fallback_price
     order_id = detail.get("OrderID")
     return filled_qty, avg_price, int(order_id) if order_id not in {None, ""} else None
+
+
+def _latest_open_time(scores: pd.DataFrame) -> int | str | None:
+    if scores.empty or "open_time" not in scores.columns:
+        return None
+    value = scores["open_time"].max()
+    if pd.isna(value):
+        return None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
