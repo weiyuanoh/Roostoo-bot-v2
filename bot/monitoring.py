@@ -12,6 +12,7 @@ import pandas as pd
 
 from bot.binance_data import BinanceData
 from bot.config import LOG_DIR, LIVE_STATE_PATH, TRADEABLE_COINS
+from bot.forward_ic import spearman_ic
 from bot.live_state import LiveState, wallet_pair_quantities
 from bot.telemetry import log_monitor_event
 
@@ -266,7 +267,7 @@ def forward_report(
                 "horizon": int(horizon),
                 "observations": int(len(group)),
                 "spearman_ic": (
-                    float(valid["score"].corr(valid["forward_return"], method="spearman"))
+                    spearman_ic(valid["score"], valid["forward_return"])[0]
                     if len(valid) >= 3
                     else np.nan
                 ),
