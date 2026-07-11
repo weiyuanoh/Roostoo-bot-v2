@@ -215,6 +215,11 @@ reports/live_monitoring/exit_reason_attribution.csv
 reports/live_monitoring/slippage.csv
 reports/live_monitoring/forward_ic.csv
 reports/live_monitoring/health.json
+reports/live_monitoring/regime_snapshot.csv
+reports/live_monitoring/rank_persistence.csv
+reports/live_monitoring/score_gap_report.csv
+reports/live_monitoring/same_pair_reentry.csv
+reports/live_monitoring/post_exit_returns.csv
 ```
 
 ### Backtest Infrastructure
@@ -531,6 +536,7 @@ Current coverage includes:
 - portfolio backtest behavior
 - liquidation planning
 - live telemetry and monitoring reports
+- no-lookahead backtest regime diagnostics
 
 ## Next Work
 
@@ -540,7 +546,7 @@ Research is paused. Deployment, operations, and live diagnostics are now the pri
 2. Confirm Roostoo balances, minimum order handling, and local `data/live_state.json`.
 3. Execute one live cycle, then verify orders and local state reconciliation.
 4. Move production operation from raw terminal / tmux to `systemd` or another process manager.
-5. Review `monitor-summary` and `monitor-forward` after enough live cycles accumulate.
+5. Review `monitor-summary`, `monitor-forward`, and `monitor-regime` after enough live cycles accumulate.
 6. Add Telegram delivery for high-severity `monitor_events.jsonl` findings.
 7. Resume research only after live operation and attribution are stable.
 
