@@ -427,6 +427,33 @@ The generic backtest writes:
 <prefix>_metadata.json
 ```
 
+Run no-lookahead regime diagnostics on the deployment baseline backtest:
+
+```bash
+.venv/bin/python -m bot.backtest.regime_diagnostics \
+  --features notebooks/microstructure/momentum_roll_impact_is_os_1h_features_8m.csv \
+  --trades reports/backtests/rerun_deployment_baseline_slip5_trades.csv \
+  --equity reports/backtests/rerun_deployment_baseline_slip5_equity.csv \
+  --metadata reports/backtests/rerun_deployment_baseline_slip5_metadata.json \
+  --output-dir reports/backtests/regime_diagnostics \
+  --prefix momentum_only_slip5
+```
+
+This writes:
+
+```text
+momentum_only_slip5_entry_regime.csv
+momentum_only_slip5_trade_outcome_attribution.csv
+momentum_only_slip5_rank_persistence.csv
+momentum_only_slip5_score_gap_report.csv
+momentum_only_slip5_same_pair_reentry.csv
+momentum_only_slip5_post_exit_returns.csv
+momentum_only_slip5_shadow_regime_filters.csv
+```
+
+Regime diagnostics are analysis-only. Candidate filters are evaluated offline
+and do not change live execution.
+
 ## Operational Notes
 
 For live testing, use `tmux` so the bot keeps running if the terminal disconnects:
@@ -473,6 +500,11 @@ Generate local monitoring reports:
 .venv/bin/python -m bot.main monitor-forward \
   --since-hours 720 \
   --horizons 1,6,24 \
+  --output-dir reports/live_monitoring
+
+.venv/bin/python -m bot.main monitor-regime \
+  --since-hours 168 \
+  --horizons 1,3,6,24 \
   --output-dir reports/live_monitoring
 ```
 

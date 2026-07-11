@@ -288,6 +288,65 @@ def write_forward_report(frame: pd.DataFrame, output_dir: Path) -> Path:
     return path
 
 
+def regime_reports(
+    *,
+    log_dir: Path = LOG_DIR,
+    since_hours: int = 168,
+) -> dict[str, pd.DataFrame]:
+    scores = since_filter(read_jsonl(log_dir / "live_scores.jsonl"), since_hours)
+    if scores.empty:
+        return _empty_regime_reports()
+    from bot.backtest.regime_diagnostics import add_decision_time_regime_features
+
+    scored = scores.dropna(subset=["pair", "open_time", "score", "close"]).copy()
+    if scored.empty:
+        return _empty_regime_reports()
+    scored["ridge_score"] = pd.to_numeric(scored["score"], errors="coerce")
+    scored["open_time"] = pd.to_numeric(scored["open_time"], errors="coerce").astype("Int64")
+    scored["close"] = pd.to_numeric(scored["close"], errors="coerce")
+    regime = add_decision_time_regime_features(scored.dropna(subset=["open_time"]).copy())
+    rank1 = regime[regime["entry_rank"].eq(1)].copy()
+    snapshot_cols = [
+        "logged_at",
+        "cycle_id",
+        "open_time",
+        "pair",
+        "ridge_score",
+        "score_gap_rank1_rank2",
+        "score_gap_rank1_median",
+        "score_gap_rank1_rank2_trailing_median",
+        "pair_top3_count_3h",
+        "pair_rank1_count_3h",
+        "universe_breadth_1h",
+        "universe_return_1h",
+        "universe_volatility_1h",
+        "intended_entry",
+        "held",
+    ]
+    regime_snapshot = rank1[[col for col in snapshot_cols if col in rank1.columns]].copy()
+    rank_persistence = _live_rank_persistence_report(regime)
+    score_gap = _live_score_gap_report(rank1)
+    same_pair = _live_same_pair_reentry(read_jsonl(log_dir / "trades.jsonl"))
+    post_exit = _live_post_exit_returns(read_jsonl(log_dir / "closed_trades.jsonl"))
+    return {
+        "regime_snapshot": regime_snapshot,
+        "rank_persistence": rank_persistence,
+        "score_gap_report": score_gap,
+        "same_pair_reentry": same_pair,
+        "post_exit_returns": post_exit,
+    }
+
+
+def write_regime_reports(reports: dict[str, pd.DataFrame], output_dir: Path) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name, frame in reports.items():
+        path = output_dir / f"{name}.csv"
+        frame.to_csv(path, index=False)
+        paths.append(path)
+    return paths
+
+
 def _issue(event_type: str, severity: str, message: str, data: dict[str, Any]) -> dict[str, Any]:
     return {
         "event_type": event_type,
@@ -296,6 +355,104 @@ def _issue(event_type: str, severity: str, message: str, data: dict[str, Any]) -
         "message": message,
         "data": data,
     }
+
+
+def _empty_regime_reports() -> dict[str, pd.DataFrame]:
+    return {
+        "regime_snapshot": pd.DataFrame(),
+        "rank_persistence": pd.DataFrame(),
+        "score_gap_report": pd.DataFrame(),
+        "same_pair_reentry": pd.DataFrame(),
+        "post_exit_returns": pd.DataFrame(),
+    }
+
+
+def _live_rank_persistence_report(regime: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for col in ("pair_top3_count_3h", "pair_top3_count_6h", "pair_top3_count_12h"):
+        if col not in regime.columns:
+            continue
+        grouped = regime.groupby(col, dropna=False, observed=True)
+        for value, group in grouped:
+            rows.append(
+                {
+                    "metric": col,
+                    "bucket": value,
+                    "observations": int(len(group)),
+                    "intended_entry_rate": float(group.get("intended_entry", pd.Series(dtype=bool)).fillna(False).mean()),
+                    "rank1_rate": float(group["entry_rank"].eq(1).mean()),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _live_score_gap_report(rank1: pd.DataFrame) -> pd.DataFrame:
+    if rank1.empty or "score_gap_rank1_rank2" not in rank1.columns:
+        return pd.DataFrame()
+    out = rank1.copy()
+    try:
+        out["score_gap_bucket"] = pd.qcut(
+            pd.to_numeric(out["score_gap_rank1_rank2"], errors="coerce"),
+            q=4,
+            duplicates="drop",
+        ).astype(str)
+    except ValueError:
+        out["score_gap_bucket"] = "all"
+    return (
+        out.groupby("score_gap_bucket", dropna=False, observed=True)
+        .agg(
+            observations=("pair", "size"),
+            intended_entry_rate=("intended_entry", lambda values: float(values.fillna(False).mean())),
+            mean_score_gap=("score_gap_rank1_rank2", "mean"),
+            mean_universe_breadth=("universe_breadth_1h", "mean"),
+        )
+        .reset_index()
+    )
+
+
+def _live_same_pair_reentry(trades: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "pair",
+        "entry_time",
+        "prior_exit_time",
+        "prior_exit_reason",
+        "hours_since_prior_exit",
+        "filled_avg_price",
+    ]
+    if trades.empty or "side" not in trades.columns:
+        return pd.DataFrame(columns=columns)
+    buys = trades[trades["side"].eq("BUY") & trades.get("success", False).fillna(False)].copy()
+    sells = trades[trades["side"].eq("SELL") & trades.get("success", False).fillna(False)].copy()
+    if buys.empty or sells.empty:
+        return pd.DataFrame(columns=columns)
+    buys["entry_time"] = pd.to_datetime(buys["logged_at"], utc=True, errors="coerce")
+    sells["exit_time"] = pd.to_datetime(sells["logged_at"], utc=True, errors="coerce")
+    rows = []
+    for buy in buys.sort_values("entry_time").itertuples(index=False):
+        prior = sells[(sells["pair"] == buy.pair) & (sells["exit_time"] < buy.entry_time)].sort_values("exit_time")
+        if prior.empty:
+            continue
+        last = prior.iloc[-1]
+        rows.append(
+            {
+                "pair": buy.pair,
+                "entry_time": buy.entry_time,
+                "prior_exit_time": last["exit_time"],
+                "prior_exit_reason": last.get("reason"),
+                "hours_since_prior_exit": (buy.entry_time - last["exit_time"]).total_seconds() / 3600,
+                "filled_avg_price": getattr(buy, "filled_avg_price", np.nan),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _live_post_exit_returns(closed: pd.DataFrame) -> pd.DataFrame:
+    columns = ["pair", "exit_time", "exit_reason", "gross_return", "gross_pnl"]
+    if closed.empty:
+        return pd.DataFrame(columns=columns)
+    out = closed.copy()
+    out["exit_time"] = pd.to_datetime(out.get("logged_at"), utc=True, errors="coerce")
+    return out[[col for col in columns if col in out.columns]].copy()
 
 
 def _sum_bool(frame: pd.DataFrame, col: str) -> int:

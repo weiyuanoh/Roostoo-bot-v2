@@ -8,7 +8,9 @@ from bot.monitoring import (
     forward_report,
     health_report,
     positions_rows,
+    regime_reports,
     summary_reports,
+    write_regime_reports,
     write_summary_reports,
 )
 
@@ -135,3 +137,48 @@ def test_forward_report_computes_horizon_returns(tmp_path):
     assert set(report["horizon"]) == {1, 6}
     assert report.loc[report["horizon"].eq(1), "intent_mean_return"].iloc[0] == pytest.approx(0.01)
     assert report.loc[report["horizon"].eq(6), "intent_mean_return"].iloc[0] == pytest.approx(0.06)
+
+
+def test_regime_reports_from_live_scores(tmp_path):
+    rows = []
+    for idx, open_time in enumerate([1000, 3_601_000, 7_201_000]):
+        rows.extend(
+            [
+                {
+                    "logged_at": "2099-01-01T00:00:00+00:00",
+                    "cycle_id": f"c{idx}",
+                    "pair": "BTC/USD",
+                    "open_time": open_time,
+                    "close": 100 + idx,
+                    "score": 2 + idx,
+                    "rank": 1,
+                    "intended_entry": idx == 2,
+                    "held": False,
+                },
+                {
+                    "logged_at": "2099-01-01T00:00:00+00:00",
+                    "cycle_id": f"c{idx}",
+                    "pair": "ETH/USD",
+                    "open_time": open_time,
+                    "close": 50,
+                    "score": 1,
+                    "rank": 2,
+                    "intended_entry": False,
+                    "held": False,
+                },
+            ]
+        )
+    write_jsonl(tmp_path / "live_scores.jsonl", rows)
+
+    reports = regime_reports(log_dir=tmp_path, since_hours=24 * 365 * 100)
+    paths = write_regime_reports(reports, tmp_path / "reports")
+
+    assert not reports["regime_snapshot"].empty
+    assert not reports["rank_persistence"].empty
+    assert {path.name for path in paths} == {
+        "regime_snapshot.csv",
+        "rank_persistence.csv",
+        "score_gap_report.csv",
+        "same_pair_reentry.csv",
+        "post_exit_returns.csv",
+    }

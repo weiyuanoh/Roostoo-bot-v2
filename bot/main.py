@@ -34,9 +34,11 @@ from bot.monitoring import (
     forward_report,
     health_report,
     positions_rows,
+    regime_reports,
     summary_reports,
     write_forward_report,
     write_health_report,
+    write_regime_reports,
     write_summary_reports,
 )
 from bot.roostoo_client import RoostooClient
@@ -386,6 +388,14 @@ def monitor_forward(args: argparse.Namespace) -> int:
     return 0
 
 
+def monitor_regime(args: argparse.Namespace) -> int:
+    reports = regime_reports(since_hours=args.since_hours)
+    paths = write_regime_reports(reports, Path(args.output_dir))
+    for path in paths:
+        print(path)
+    return 0
+
+
 def _fmt_optional(value) -> str:
     if value is None:
         return "n/a"
@@ -448,6 +458,11 @@ def main() -> int:
     forward_parser.add_argument("--horizons", default="1,6,24")
     forward_parser.add_argument("--output-dir", default=str(default_output_dir()))
 
+    regime_parser = subparsers.add_parser("monitor-regime", help="Write live regime diagnostics reports")
+    regime_parser.add_argument("--since-hours", type=int, default=168)
+    regime_parser.add_argument("--horizons", default="1,3,6,24", help="Reserved for report compatibility")
+    regime_parser.add_argument("--output-dir", default=str(default_output_dir()))
+
     args = parser.parse_args()
     if args.command == "smoke":
         return smoke()
@@ -478,6 +493,8 @@ def main() -> int:
         return monitor_summary(args)
     if args.command == "monitor-forward":
         return monitor_forward(args)
+    if args.command == "monitor-regime":
+        return monitor_regime(args)
     raise AssertionError(f"unhandled command {args.command}")
 
 
