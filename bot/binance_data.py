@@ -113,6 +113,54 @@ class BinanceData:
             for kline in raw
         ]
 
+    def fetch_klines_paginated(
+        self,
+        pair: str,
+        interval: str = "1h",
+        *,
+        start_time: int,
+        end_time: int,
+        limit: int = 1000,
+        sleep_seconds: float = 0.1,
+    ) -> list[Candle] | None:
+        """Fetch klines over a long range using Binance's 1000-row page limit."""
+        if start_time >= end_time:
+            return []
+        cursor = int(start_time)
+        out: list[Candle] = []
+        seen: set[int] = set()
+        while cursor < end_time:
+            candles = self.fetch_klines(
+                pair,
+                interval=interval,
+                limit=limit,
+                start_time=cursor,
+                end_time=end_time,
+            )
+            if candles is None:
+                return None
+            if not candles:
+                break
+            new_count = 0
+            for candle in candles:
+                open_time = int(candle["open_time"])
+                if open_time >= end_time:
+                    continue
+                if open_time not in seen:
+                    out.append(candle)
+                    seen.add(open_time)
+                    new_count += 1
+            last_open_time = int(candles[-1]["open_time"])
+            next_cursor = last_open_time + 1
+            if next_cursor <= cursor or new_count == 0:
+                break
+            cursor = next_cursor
+            if len(candles) < min(limit, 1000):
+                break
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+        return sorted(out, key=lambda candle: int(candle["open_time"]))
+
     def load_history(
         self,
         pairs: list[str] | None = None,
@@ -171,4 +219,3 @@ class BinanceData:
         if n is not None:
             values = values[-n:]
         return values
-

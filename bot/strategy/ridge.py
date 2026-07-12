@@ -6,7 +6,7 @@ portfolio backtests, and live trading.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -16,13 +16,19 @@ import pandas as pd
 from bot.features import add_alpha_features
 from bot.forward_ic import add_forward_return, information_coefficient
 from bot.microstructure import compute_microstructure_measures
-from bot.strategy.regime import RegimeDecision, RegimeThrottleConfig, decide_regime_throttle
+from bot.strategy.regime import (
+    ClusterRegimeGate,
+    ClusterGateDecision,
+    RegimeDecision,
+    RegimeThrottleConfig,
+    decide_regime_throttle,
+)
 
 
-DEFAULT_FEATURE_PATH = Path("notebooks/microstructure/momentum_roll_impact_is_os_1h_features_8m.csv")
+DEFAULT_FEATURE_PATH = Path("data/features/live_1h_features_30m.csv")
 DEFAULT_HORIZON = 24
-DEFAULT_IS_MONTHS = 4
-DEFAULT_OS_MONTHS = 4
+DEFAULT_IS_MONTHS = 3
+DEFAULT_OS_MONTHS = 2
 DEFAULT_STEP_MONTHS = 1
 DEFAULT_RIDGE_ALPHAS = (0.1, 1.0, 10.0, 100.0)
 DEFAULT_TOP_KS = (3, 5)
@@ -85,6 +91,11 @@ class TradeIntent:
     score: float | None = None
     reason: str = ""
     price: float | None = None
+    cluster_gate_enabled: bool = False
+    cluster_gate_allowed: bool | None = None
+    cluster_id: int | None = None
+    cluster_distance: float | None = None
+    cluster_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +103,7 @@ class CycleIntents:
     exits: list[TradeIntent]
     entries: list[TradeIntent]
     regime: RegimeDecision | None = None
+    entry_gate_decisions: list[dict[str, Any]] = field(default_factory=list)
 
 
 def model_terms(model_name: str) -> tuple[str, ...]:
@@ -403,19 +415,49 @@ def entry_intents(
     price_col: str = "close",
     score_col: str = "ridge_score",
 ) -> list[TradeIntent]:
+    entries, _ = entry_intents_with_gate(
+        scores,
+        held_pairs,
+        portfolio_value,
+        available_cash,
+        position_fraction=position_fraction,
+        max_positions=max_positions,
+        top_k=top_k,
+        max_new_entries=max_new_entries,
+        price_col=price_col,
+        score_col=score_col,
+    )
+    return entries
+
+
+def entry_intents_with_gate(
+    scores: pd.DataFrame,
+    held_pairs: set[str],
+    portfolio_value: float,
+    available_cash: float,
+    *,
+    position_fraction: float,
+    max_positions: int,
+    top_k: int | None = None,
+    max_new_entries: int | None = None,
+    price_col: str = "close",
+    score_col: str = "ridge_score",
+    cluster_gate: ClusterRegimeGate | None = None,
+) -> tuple[list[TradeIntent], list[dict[str, Any]]]:
     if portfolio_value <= 0 or position_fraction <= 0 or max_positions <= 0:
-        return []
+        return [], []
     if top_k is not None and top_k <= 0:
-        return []
+        return [], []
     if max_new_entries is not None and max_new_entries <= 0:
-        return []
+        return [], []
     slots = max_positions - len(held_pairs)
     if slots <= 0 or available_cash <= 0:
-        return []
+        return [], []
     entry_limit = slots
     if max_new_entries is not None:
         entry_limit = min(entry_limit, max_new_entries)
     intents = []
+    gate_decisions = []
     ranked = scores.dropna(subset=[score_col, price_col]).sort_values(score_col, ascending=False)
     if top_k is not None:
         ranked = ranked.head(top_k)
@@ -427,6 +469,25 @@ def entry_intents(
         score = float(getattr(row, score_col))
         if pair in held_pairs or price <= 0:
             continue
+        decision: ClusterGateDecision | None = None
+        if cluster_gate is not None:
+            row_series = pd.Series(row._asdict())
+            decision = cluster_gate.decide(
+                row_series,
+                positions_at_entry=len(held_pairs) + len(intents),
+            )
+            gate_decisions.append(
+                {
+                    "pair": pair,
+                    "score": score,
+                    "cluster_gate_allowed": decision.allowed,
+                    "cluster_id": decision.cluster_id,
+                    "cluster_distance": decision.distance,
+                    "cluster_reason": decision.reason,
+                }
+            )
+            if not decision.allowed:
+                continue
         notional = min(portfolio_value * position_fraction, available_cash)
         if notional <= 0:
             break
@@ -438,10 +499,15 @@ def entry_intents(
                 score=score,
                 reason="ridge_entry",
                 price=price,
+                cluster_gate_enabled=cluster_gate is not None,
+                cluster_gate_allowed=decision.allowed if decision is not None else None,
+                cluster_id=decision.cluster_id if decision is not None else None,
+                cluster_distance=decision.distance if decision is not None else None,
+                cluster_reason=decision.reason if decision is not None else None,
             )
         )
         available_cash -= notional
-    return intents
+    return intents, gate_decisions
 
 
 def exit_intent(
@@ -525,6 +591,7 @@ def build_cycle_intents(
     top_k: int | None = None,
     max_new_entries: int | None = None,
     regime_config: RegimeThrottleConfig | None = None,
+    cluster_gate: ClusterRegimeGate | None = None,
     rank_exit_threshold: int | None = None,
     take_profit: float,
     stop_loss: float,
@@ -562,7 +629,7 @@ def build_cycle_intents(
     regime = decide_regime_throttle(scores, regime_config) if regime_config is not None else None
     effective_max_new_entries = 0 if regime and regime.entries_blocked else max_new_entries
 
-    entries = entry_intents(
+    entries, gate_decisions = entry_intents_with_gate(
         scores,
         held_pairs,
         portfolio_value,
@@ -571,6 +638,7 @@ def build_cycle_intents(
         max_positions=max_positions,
         top_k=top_k,
         max_new_entries=effective_max_new_entries,
+        cluster_gate=cluster_gate,
     )
     entries = [intent for intent in entries if intent.pair in price_map]
-    return CycleIntents(exits=exits, entries=entries, regime=regime)
+    return CycleIntents(exits=exits, entries=entries, regime=regime, entry_gate_decisions=gate_decisions)

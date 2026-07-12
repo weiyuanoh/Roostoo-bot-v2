@@ -17,3 +17,16 @@ def test_write_csv_sorts_and_deduplicates(tmp_path):
     assert lines[2].startswith("2,9")
     assert len(lines) == 3
 
+
+def test_read_many_adds_pair_and_combines(tmp_path):
+    store = CandleStore(tmp_path)
+    candles = [
+        {"open_time": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1, "close_time": 2},
+    ]
+    store.write_csv("BTC/USD", "1h", candles)
+    store.write_csv("ETH/USD", "1h", candles)
+
+    frame = store.read_many(("BTC/USD", "ETH/USD"), "1h")
+
+    assert set(frame["pair"]) == {"BTC/USD", "ETH/USD"}
+    assert len(frame) == 2

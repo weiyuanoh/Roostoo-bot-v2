@@ -6,13 +6,39 @@ Research and live-trading environment for a long-only crypto spot bot that:
 - collects live market data from Binance public spot klines
 - centralizes feature, scoring, risk, and execution infrastructure so notebooks, backtests, and live trading do not drift
 
-## Current Deployment Baseline
+## Current Research Hypothesis
 
-Research is paused for deployment. The current deployment baseline is the
-fixed top-30 USD universe with the `momentum_only` ridge score and TP/SL exits
-only. Rank-decay exits and Roll-impact regime throttles did not beat the plain
-TP/SL baseline after costs, so they should remain disabled unless a future
-research pass shows a clear out-of-sample improvement.
+The current deployment-style question is whether scheduled live refitting
+improves the same two-month out-of-sample trading window versus a fully fixed
+deployment.
+
+Both variants use the fixed top-30 USD universe, `momentum_only` ridge score,
+and TP/SL exits. The comparison must use one canonical long feature file:
+
+```text
+data/features/live_1h_features_30m.csv
+```
+
+V1 freezes ridge and regime artifacts for the whole OOS window:
+
+```text
+ridge train:  T - 3 months  -> T
+regime train: T - 24 months -> T
+trade:        T             -> T + 2 months
+```
+
+V2 trades the same OOS window but refits on a live schedule without closing
+positions at refit boundaries:
+
+```text
+ridge refit:  every 7 days, using refit_time - 3 months -> refit_time
+regime refit: every 1 month, using refit_time - 24 months -> refit_time
+trade:        same T -> T + 2 months OOS window as V1
+```
+
+Rank-decay exits and direct Roll-impact alpha overlays did not beat the plain
+TP/SL momentum baseline in prior short-sample studies, so they remain disabled
+unless a future 30-month OOS test shows a clear improvement after costs.
 
 ```text
 universe = fixed_top30_median_dollar_volume
@@ -38,22 +64,8 @@ FET/USD, FIL/USD, TRUMP/USD, TON/USD, DOT/USD, ICP/USD, APT/USD,
 VIRTUAL/USD
 ```
 
-Latest relevant backtest artifacts:
-
-- `reports/backtests/rank_decay_exit_top3_top30.md`
-- `reports/backtests/rank_decay_exit_top3_top30_baseline_slip0_summary.csv`
-- `reports/backtests/rank_decay_exit_top3_top30_baseline_slip5_summary.csv`
-- `reports/backtests/rank_decay_exit_top3_top30_candidate_slip0_summary.csv`
-- `reports/backtests/rank_decay_exit_top3_top30_candidate_slip5_summary.csv`
-
-Result summary:
-
-```text
-TP/SL baseline, 0 bps slippage:   +15.18%, rank_decay_exits=0
-rank-decay candidate, 0 bps:      -12.59%, rank_decay_exits=414
-TP/SL baseline, 5 bps slippage:    +0.14%, rank_decay_exits=0
-rank-decay candidate, 5 bps:      -30.07%, rank_decay_exits=414
-```
+Generated backtest artifacts are intentionally local and disposable. Stale
+short-sample CSV outputs should not be used for the current V1/V2 comparison.
 
 ## Research Log
 
@@ -63,11 +75,11 @@ The original hypothesis was:
 
 The evidence from initial 1h-candle IC checks was weak. Microstructure measures, including Roll measure, Roll impact, VPIN-like measures, and related liquidity proxies, did not show strong standalone predictive power for 1h, 6h, or 24h forward returns.
 
-A live-style portfolio backtest on the 8-pair live universe also failed to validate microstructure as a linear alpha overlay. With 4 months IS / 4 months OS, 1h candles, 24h forward-return training target, `top_k=1`, `max_new_entries=1`, `max_positions=3`, `position_fraction=0.25`, `tp=0.03`, and `sl=0.015`, `momentum_only` returned `+4.94%` OS while `momentum_plus_roll_plus_interaction` returned `-4.04%` OS. The combined model improved in-sample IC, but did not improve traded OS performance.
+Prior live-style portfolio backtests also failed to validate microstructure as a linear alpha overlay. Roll-aware models sometimes improved in-sample IC, but did not improve traded out-of-sample performance after portfolio rules and costs.
 
-The working hypothesis has therefore evolved:
+The working alpha hypothesis has therefore evolved:
 
-> Recent momentum is the primary alpha. Microstructure, especially Roll impact / low-liquidity stress, may be useful as a regime, risk, or exposure modifier rather than as a direct alpha.
+> Recent momentum is the primary alpha. Microstructure, especially Roll impact / low-liquidity stress, is secondary execution-quality or risk context rather than a direct alpha.
 
 The research baseline became:
 
@@ -76,7 +88,7 @@ baseline = momentum_only
 score = beta_momentum * z_momentum
 ```
 
-Any microstructure layer must improve this baseline out-of-sample after fees and realistic slippage, preferably by reducing drawdown, stop-hit rate, bad pair exposure, or left-tail losses without destroying return.
+Any microstructure layer must improve this baseline out-of-sample after fees and realistic slippage, preferably by reducing drawdown, stop-hit rate, bad pair exposure, left-tail losses, or realized slippage without destroying return.
 
 The live strategy can run either:
 
@@ -111,9 +123,9 @@ z_momentum_x_low_roll_impact
 - Optional CSV candle persistence for backtesting / research only
 - Live trading fetches Binance data directly
 
-### Microstructure And Features
+### Features And Execution Quality
 
-- Microstructure measures in `bot/microstructure.py`
+- Microstructure / execution-quality measures in `bot/microstructure.py`
 - Alpha features in `bot/features.py`
 - Forward return and IC helpers in `bot/forward_ic.py`
 - Shared ridge score implementation in `bot/strategy/ridge.py`
@@ -129,9 +141,9 @@ notebooks/microstructure/
 
 Existing checks include:
 
-- microstructure IC checks on 1h candles
+- archival microstructure IC checks on 1h candles
 - feature IC checks on 1h candles
-- momentum + Roll impact risk-filter checks
+- momentum + Roll impact risk/execution-quality filter checks
 - ridge score walk-forward checks
 - portfolio backtest outputs
 
@@ -229,7 +241,8 @@ The backtest was refactored to better mimic live trading:
 - shared cycle intent builder in `bot/strategy/ridge.py`
 - Roostoo-like simulated executor in `bot/backtest/simulated_executor.py`
 - portfolio accounting in `bot/backtest/portfolio.py`
-- portfolio backtest in `bot/backtest/ridge_score_portfolio.py`
+- generic rolling portfolio backtest in `bot/backtest/ridge_score_portfolio.py`
+- fixed-vs-scheduled OOS refit comparison in `bot/backtest/refit_policy_experiment.py`
 
 Backtest validity improvements:
 
@@ -250,11 +263,11 @@ Known remaining mismatch:
 Backtest flow:
 
 ```text
-1. Load the feature CSV, usually notebooks/microstructure/momentum_roll_impact_is_os_1h_features_8m.csv.
+1. Load the feature CSV, usually data/features/live_1h_features_30m.csv.
 2. Recompute ridge signal columns and forward-return targets.
 3. Filter to the requested pair universe.
-4. Build rolling IS/OS folds.
-5. For each fold, train ridge on the IS window and score the OS window.
+4. Build rolling IS/OS folds, or use `refit_policy_experiment` for the fixed V1 versus scheduled V2 deployment-style comparison.
+5. For each fold or refit segment, train ridge only on data available before that segment and score the OOS window.
 6. Step through OS candles one hourly bar at a time.
 7. Mark current portfolio value from candle close prices.
 8. Build exit and entry intents with the same shared strategy logic used live.
@@ -436,10 +449,10 @@ Run no-lookahead regime diagnostics on the deployment baseline backtest:
 
 ```bash
 .venv/bin/python -m bot.backtest.regime_diagnostics \
-  --features notebooks/microstructure/momentum_roll_impact_is_os_1h_features_8m.csv \
-  --trades reports/backtests/rerun_deployment_baseline_slip5_trades.csv \
-  --equity reports/backtests/rerun_deployment_baseline_slip5_equity.csv \
-  --metadata reports/backtests/rerun_deployment_baseline_slip5_metadata.json \
+  --features data/features/live_1h_features_30m.csv \
+  --trades reports/backtests/<prefix>_trades.csv \
+  --equity reports/backtests/<prefix>_equity.csv \
+  --metadata reports/backtests/<prefix>_metadata.json \
   --output-dir reports/backtests/regime_diagnostics \
   --prefix momentum_only_slip5
 ```
@@ -459,7 +472,176 @@ momentum_only_slip5_shadow_regime_filters.csv
 Regime diagnostics are analysis-only. Candidate filters are evaluated offline
 and do not change live execution.
 
+### Learned Regime Cluster Gate
+
+The learned cluster gate is a default-off backtest candidate. It trains on a
+larger prior historical window than the ridge IS window, clusters only
+decision-time entry features, labels historically profitable clusters, and then
+allows future entries only when the current top-ranked candidate looks like one
+of those profitable clusters. Exits are never blocked.
+
+Run the deployment-style momentum backtest with the learned gate:
+
+```bash
+.venv/bin/python -m bot.backtest.ridge_score_portfolio \
+  --features data/features/live_1h_features_30m.csv \
+  --output-dir reports/backtests/cluster_regime \
+  --prefix momentum_only_cluster_gate_slip5 \
+  --pairs "$PAIRS" \
+  --model momentum_only \
+  --is-months 3 \
+  --os-months 2 \
+  --step-months 1 \
+  --top-k 1 \
+  --max-new-entries 1 \
+  --max-positions 3 \
+  --position-fraction 0.25 \
+  --tp 0.03 \
+  --sl 0.015 \
+  --fee-bps 10 \
+  --slippage-bps 5 \
+  --cluster-regime-gate \
+  --cluster-lookback-months 24 \
+  --cluster-n-clusters 4 \
+  --cluster-min-trades 50
+```
+
+Or run baseline and learned-gate variants together:
+
+```bash
+.venv/bin/python -m bot.backtest.cluster_regime_gate_experiment \
+  --features data/features/live_1h_features_30m.csv \
+  --output-dir reports/backtests/cluster_regime \
+  --prefix momentum_only_cluster_gate \
+  --pairs "$PAIRS"
+```
+
+Additional reports are written when the gate is enabled:
+
+```text
+<prefix>_cluster_gate_decisions.csv
+<prefix>_cluster_gate_summary.csv
+<prefix>_cluster_gate_profiles.csv
+```
+
+Live execution uses this gate only when `--cluster-regime-gate` is passed with
+a `--model-dir` containing saved artifacts. The current startup fetch remains
+limited to `LIVE_HISTORY_LIMIT=1000` hourly candles, so production-style usage
+should train artifacts from local paginated history first.
+
 ## Operational Notes
+
+### Fixed Data Windows
+
+The intended live research policy is explicit:
+
+```text
+ridge / alpha model:    3 months of 1h data, refit weekly
+regime cluster library: 24 months of 1h data, refit monthly
+hourly live trading:    use the latest saved artifacts; do not refit hourly
+```
+
+The old `--history-limit` startup training path is still available, but it is
+not the preferred path for production-style runs because Binance single kline
+requests are capped at 1000 candles.
+
+Collect a long local candle history:
+
+```bash
+.venv/bin/python -m bot.main collect-history \
+  --pairs "$PAIRS" \
+  --interval 1h \
+  --start 2024-07-01 \
+  --end 2026-07-01 \
+  --output-dir data/candles
+```
+
+Build one shared feature file from the local candles:
+
+```bash
+.venv/bin/python -m bot.main build-features \
+  --pairs "$PAIRS" \
+  --interval 1h \
+  --input-dir data/candles \
+  --output data/features/live_1h_features_30m.csv
+```
+
+Run the fixed-vs-scheduled OOS refit comparison:
+
+```bash
+.venv/bin/python -m bot.backtest.refit_policy_experiment \
+  --features data/features/live_1h_features_30m.csv \
+  --pairs "$PAIRS" \
+  --os-months 2 \
+  --ridge-train-months 3 \
+  --regime-train-months 24 \
+  --ridge-refit-days 7 \
+  --regime-refit-months 1 \
+  --model momentum_only \
+  --top-k 1 \
+  --max-new-entries 1 \
+  --max-positions 3 \
+  --position-fraction 0.25 \
+  --tp 0.03 \
+  --sl 0.015 \
+  --fee-bps 10 \
+  --slippage-bps 5 \
+  --cluster-n-clusters 4 \
+  --cluster-min-trades 50
+```
+
+Train the saved live artifacts:
+
+```bash
+.venv/bin/python -m bot.main train-live-models \
+  --features data/features/live_1h_features_30m.csv \
+  --pairs "$PAIRS" \
+  --model-dir data/models \
+  --model momentum_only \
+  --ridge-train-months 3 \
+  --regime-train-months 24 \
+  --top-k 1 \
+  --max-new-entries 1 \
+  --max-positions 3 \
+  --position-fraction 0.25 \
+  --tp 0.03 \
+  --sl 0.015 \
+  --fee-bps 10 \
+  --slippage-bps 5 \
+  --cluster-n-clusters 4 \
+  --cluster-min-trades 50
+```
+
+This writes:
+
+```text
+data/models/ridge_selection.json
+data/models/cluster_regime_gate.json
+```
+
+Run live from saved artifacts:
+
+```bash
+.venv/bin/python -m bot.main live \
+  --pairs "$PAIRS" \
+  --model-dir data/models \
+  --cluster-regime-gate \
+  --top-k 1 \
+  --max-new-entries 1 \
+  --max-positions 3 \
+  --position-fraction 0.25 \
+  --tp 0.03 \
+  --sl 0.015 \
+  --execute
+```
+
+Operational cadence:
+
+```text
+weekly:  refresh candles, rebuild features, rerun train-live-models for ridge
+monthly: refresh candles, rebuild features, rerun train-live-models for ridge + regime
+hourly:  live bot only scores/trades with the saved artifacts
+```
 
 For live testing, use `tmux` so the bot keeps running if the terminal disconnects:
 

@@ -296,7 +296,7 @@ def regime_reports(
     scores = since_filter(read_jsonl(log_dir / "live_scores.jsonl"), since_hours)
     if scores.empty:
         return _empty_regime_reports()
-    from bot.backtest.regime_diagnostics import add_decision_time_regime_features
+    from bot.strategy.regime import add_decision_time_regime_features
 
     scored = scores.dropna(subset=["pair", "open_time", "score", "close"]).copy()
     if scored.empty:

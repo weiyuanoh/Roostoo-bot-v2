@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from bot.backtest.ridge_score_portfolio import filter_pairs, parse_pairs
+from bot.strategy.regime import PERSISTENCE_WINDOWS, add_decision_time_regime_features
 from bot.strategy.ridge import (
     DEFAULT_FEATURE_PATH,
     DEFAULT_RIDGE_ALPHAS,
@@ -22,7 +23,6 @@ from bot.strategy.ridge import (
 
 DEFAULT_OUTPUT_DIR = Path("reports/backtests/regime_diagnostics")
 DEFAULT_PREFIX = "momentum_only_slip5"
-PERSISTENCE_WINDOWS = (3, 6, 12)
 POST_EXIT_HORIZONS = (1, 3, 6, 24)
 DECISION_TIME_COLUMNS = {
     "entry_rank",
@@ -81,54 +81,6 @@ def load_scored_frame(
     if not parts:
         return pd.DataFrame()
     return pd.concat(parts, ignore_index=True).sort_values(["open_time", "pair"]).reset_index(drop=True)
-
-
-def add_decision_time_regime_features(scored: pd.DataFrame) -> pd.DataFrame:
-    """Add rank, score-gap, persistence, and current/prior-only market features."""
-    if scored.empty:
-        return scored.copy()
-    df = scored.sort_values(["open_time", "pair"]).copy()
-    df["entry_rank"] = df.groupby("open_time", observed=True)["ridge_score"].rank(
-        method="first",
-        ascending=False,
-    )
-    grouped = df.groupby("open_time", observed=True)
-    df["rank1_score"] = grouped["ridge_score"].transform("max")
-    df["rank2_score"] = grouped["ridge_score"].transform(_second_largest)
-    df["median_score"] = grouped["ridge_score"].transform("median")
-    df["score_gap_rank1_rank2"] = df["rank1_score"] - df["rank2_score"]
-    df["score_gap_rank1_median"] = df["rank1_score"] - df["median_score"]
-    df["rank1_pair"] = df["open_time"].map(_rank1_pairs(df))
-    gaps = (
-        df[["open_time", "score_gap_rank1_rank2"]]
-        .drop_duplicates("open_time")
-        .sort_values("open_time")
-        .set_index("open_time")["score_gap_rank1_rank2"]
-    )
-    trailing_gap = gaps.expanding(min_periods=24).median().shift(1)
-    df["score_gap_rank1_rank2_trailing_median"] = df["open_time"].map(trailing_gap)
-
-    df["is_top3"] = df["entry_rank"] <= 3
-    df["is_rank1"] = df["entry_rank"] == 1
-    for window in PERSISTENCE_WINDOWS:
-        df[f"pair_top3_count_{window}h"] = (
-            df.groupby("pair", observed=True)["is_top3"]
-            .transform(lambda values, window=window: values.rolling(window, min_periods=1).sum())
-            .astype(float)
-        )
-        df[f"pair_rank1_count_{window}h"] = (
-            df.groupby("pair", observed=True)["is_rank1"]
-            .transform(lambda values, window=window: values.rolling(window, min_periods=1).sum())
-            .astype(float)
-        )
-
-    df["pair_return_1h_known"] = df.groupby("pair", observed=True)["close"].pct_change()
-    df["universe_breadth_1h"] = df.groupby("open_time", observed=True)["pair_return_1h_known"].transform(
-        lambda values: float((values > 0).mean())
-    )
-    df["universe_return_1h"] = df.groupby("open_time", observed=True)["pair_return_1h_known"].transform("mean")
-    df["universe_volatility_1h"] = df.groupby("open_time", observed=True)["pair_return_1h_known"].transform("std")
-    return df
 
 
 def pair_trade_entries(trades: pd.DataFrame, equity: pd.DataFrame) -> pd.DataFrame:
@@ -405,20 +357,6 @@ def _metadata_pairs(metadata: dict[str, Any]) -> tuple[str, ...] | None:
     if isinstance(pair_universe, list):
         return tuple(str(pair).upper() for pair in pair_universe)
     return parse_pairs(str(pair_filter)) if isinstance(pair_filter, str) else None
-
-
-def _rank1_pairs(df: pd.DataFrame) -> dict[int, str]:
-    pairs = {}
-    for open_time, group in df.groupby("open_time", observed=True):
-        ranked = group.sort_values("ridge_score", ascending=False)
-        if not ranked.empty:
-            pairs[int(open_time)] = str(ranked.iloc[0]["pair"])
-    return pairs
-
-
-def _second_largest(values: pd.Series) -> float:
-    clean = values.dropna().sort_values(ascending=False)
-    return float(clean.iloc[1]) if len(clean) > 1 else np.nan
 
 
 def _safe_qcut(values: pd.Series, q: int) -> pd.Series:

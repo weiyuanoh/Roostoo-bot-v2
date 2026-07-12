@@ -29,7 +29,14 @@ from bot.strategy.ridge import (
     score_frame,
     select_ridge_model,
 )
-from bot.strategy.regime import RegimeThrottleConfig, add_roll_impact_regime
+from bot.strategy.regime import (
+    ClusterRegimeGate,
+    ClusterRegimeGateConfig,
+    RegimeThrottleConfig,
+    add_decision_time_regime_features,
+    add_roll_impact_regime,
+    train_cluster_regime_gate,
+)
 
 
 DEFAULT_OUTPUT_DIR = Path("notebooks/microstructure")
@@ -82,6 +89,7 @@ def run_portfolio_backtest(
     top_k: int | None = None,
     max_new_entries: int | None = None,
     regime_config: RegimeThrottleConfig | None = None,
+    cluster_gate_config: ClusterRegimeGateConfig | None = None,
     rank_exit_threshold: int | None = None,
     exchange_info: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -108,6 +116,9 @@ def run_portfolio_backtest(
     equity_rows: list[dict] = []
     trade_rows: list[dict] = []
     fold_rows: list[dict] = []
+    gate_decision_rows: list[dict] = []
+    cluster_summary_rows: list[pd.DataFrame] = []
+    cluster_profile_rows: list[pd.DataFrame] = []
 
     for fold in folds.itertuples(index=False):
         is_mask = (frame["timestamp"] >= fold.is_start) & (frame["timestamp"] < fold.is_end)
@@ -121,102 +132,58 @@ def run_portfolio_backtest(
             ridge_alphas=ridge_alphas,
         )
         scored = score_frame(test, selection.terms, selection.beta, score_col="ridge_score")
-        portfolio = Portfolio(initial_cash=initial_cash, fee_bps=fee_bps)
-        executor = SimulatedExecutor(
-            portfolio,
-            exchange_info=exchange_info,
+
+        cluster_gate, cluster_scored = _fit_cluster_gate_for_fold(
+            frame=frame,
+            selection_terms=selection.terms,
+            selection_beta=selection.beta,
+            os_start=fold.os_start,
+            config=cluster_gate_config,
+            initial_cash=initial_cash,
+            position_fraction=position_fraction,
+            take_profit=tp,
+            stop_loss=sl,
+            fee_bps=fee_bps,
             slippage_bps=slippage_bps,
+            max_positions=max_positions,
+            top_k=top_k,
+            max_new_entries=max_new_entries,
+            regime_config=regime_config,
+            rank_exit_threshold=rank_exit_threshold,
+            exchange_info=exchange_info,
         )
+        if cluster_gate is not None:
+            cluster_summary_rows.append(_tag_cluster_frame(cluster_gate.cluster_summary, fold.fold))
+            cluster_profile_rows.append(_tag_cluster_frame(cluster_gate.cluster_profiles, fold.fold))
+            scored = _os_scored_with_regime_features(cluster_scored, scored)
 
-        for open_time, bar in scored.sort_values(["open_time", "pair"]).groupby(
-            "open_time",
-            observed=True,
-        ):
-            timestamp = bar["timestamp"].iloc[0]
-            prices = {
-                str(row.pair): float(row.close)
-                for row in bar[["pair", "close"]].itertuples(index=False)
-                if pd.notna(row.close) and float(row.close) > 0
-            }
-
-            equity_value = portfolio.value(prices)
-            cycle = build_cycle_intents(
-                bar,
-                portfolio.positions,
-                prices,
-                portfolio_value=equity_value,
-                available_cash=portfolio.cash,
-                position_fraction=position_fraction,
-                max_positions=max_positions,
-                top_k=top_k,
-                max_new_entries=max_new_entries,
-                regime_config=regime_config,
-                rank_exit_threshold=rank_exit_threshold,
-                take_profit=tp,
-                stop_loss=sl,
-            )
-
-            for intent in cycle.exits:
-                executor.set_context(timestamp=open_time, reason=intent.reason)
-                before = len(executor.events)
-                executor.sell(intent.pair, intent.quantity, prices[intent.pair], use_limit=False)
-                if len(executor.events) > before:
-                    executor.events[-1]["fold"] = fold.fold
-                    _add_regime_event_fields(executor.events[-1], cycle.regime)
-                    trade_rows.append(executor.events[-1])
-
-            for intent in cycle.entries:
-                executor.set_context(
-                    timestamp=open_time,
-                    score=intent.score,
-                    reason=intent.reason,
-                )
-                before = len(executor.events)
-                executor.buy(intent.pair, intent.notional_usd, prices[intent.pair], use_limit=False)
-                if len(executor.events) > before:
-                    executor.events[-1]["fold"] = fold.fold
-                    _add_regime_event_fields(executor.events[-1], cycle.regime)
-                    trade_rows.append(executor.events[-1])
-
-            equity_after = portfolio.value(prices)
-            regime_fields = _equity_regime_fields(cycle.regime)
-            equity_rows.append(
-                {
-                    "fold": fold.fold,
-                    "open_time": open_time,
-                    "timestamp": timestamp,
-                    "equity": equity_after,
-                    "cash": portfolio.cash,
-                    "positions": len(portfolio.positions),
-                    **regime_fields,
-                }
-            )
-
-        final_prices = (
-            scored.sort_values("open_time")
-            .groupby("pair", observed=True)["close"]
-            .last()
-            .dropna()
-            .astype(float)
-            .to_dict()
+        fold_equity_rows, fold_trade_rows, fold_gate_rows = _simulate_scored_window(
+            scored,
+            fold=fold.fold,
+            initial_cash=initial_cash,
+            position_fraction=position_fraction,
+            take_profit=tp,
+            stop_loss=sl,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            max_positions=max_positions,
+            top_k=top_k,
+            max_new_entries=max_new_entries,
+            regime_config=regime_config,
+            cluster_gate=cluster_gate,
+            rank_exit_threshold=rank_exit_threshold,
+            exchange_info=exchange_info,
         )
-        for pair in list(portfolio.positions):
-            price = final_prices.get(pair)
-            if price is None:
-                continue
-            executor.set_context(timestamp="fold_end", reason="fold_end")
-            before = len(executor.events)
-            executor.sell(pair, portfolio.positions[pair].quantity, price, use_limit=False)
-            if len(executor.events) > before:
-                executor.events[-1]["fold"] = fold.fold
-                _add_regime_event_fields(executor.events[-1], None)
-                trade_rows.append(executor.events[-1])
+        equity_rows.extend(fold_equity_rows)
+        trade_rows.extend(fold_trade_rows)
+        gate_decision_rows.extend(fold_gate_rows)
 
         fold_equity = [row["equity"] for row in equity_rows if row["fold"] == fold.fold]
         metrics = compute_equity_metrics(fold_equity, initial_cash)
         exits = [row for row in trade_rows if row.get("fold") == fold.fold and row["side"] == "SELL"]
         regime_summary = _fold_regime_summary(equity_rows, fold.fold)
         trade_summary = _fold_trade_summary(exits)
+        gate_summary = _fold_cluster_gate_summary(gate_decision_rows, fold.fold, cluster_gate)
         fold_rows.append(
             {
                 "fold": fold.fold,
@@ -236,10 +203,240 @@ def run_portfolio_backtest(
                 **metrics,
                 **regime_summary,
                 **trade_summary,
+                **gate_summary,
             }
         )
 
-    return _attach_return_over_drawdown(pd.DataFrame(fold_rows)), pd.DataFrame(equity_rows), pd.DataFrame(trade_rows)
+    summary = _attach_return_over_drawdown(pd.DataFrame(fold_rows))
+    summary.attrs["cluster_gate_decisions"] = pd.DataFrame(gate_decision_rows)
+    summary.attrs["cluster_gate_summary"] = (
+        pd.concat(cluster_summary_rows, ignore_index=True) if cluster_summary_rows else pd.DataFrame()
+    )
+    summary.attrs["cluster_gate_profiles"] = (
+        pd.concat(cluster_profile_rows, ignore_index=True) if cluster_profile_rows else pd.DataFrame()
+    )
+    return summary, pd.DataFrame(equity_rows), pd.DataFrame(trade_rows)
+
+
+def _fit_cluster_gate_for_fold(
+    *,
+    frame: pd.DataFrame,
+    selection_terms: tuple[str, ...],
+    selection_beta: np.ndarray,
+    os_start: pd.Timestamp,
+    config: ClusterRegimeGateConfig | None,
+    initial_cash: float,
+    position_fraction: float,
+    take_profit: float,
+    stop_loss: float,
+    fee_bps: float,
+    slippage_bps: float,
+    max_positions: int,
+    top_k: int | None,
+    max_new_entries: int | None,
+    regime_config: RegimeThrottleConfig | None,
+    rank_exit_threshold: int | None,
+    exchange_info: dict | None,
+) -> tuple[ClusterRegimeGate | None, pd.DataFrame]:
+    if config is None:
+        return None, pd.DataFrame()
+    lookback_start = os_start - pd.DateOffset(months=config.lookback_months)
+    history = frame[(frame["timestamp"] >= lookback_start) & (frame["timestamp"] < os_start)].copy()
+    if history.empty:
+        return train_cluster_regime_gate(pd.DataFrame(), config), pd.DataFrame()
+    scored = score_frame(history, selection_terms, selection_beta, score_col="ridge_score")
+    scored = add_decision_time_regime_features(scored)
+    equity, trades, _ = _simulate_scored_window(
+        scored,
+        fold="cluster_train",
+        initial_cash=initial_cash,
+        position_fraction=position_fraction,
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        max_positions=max_positions,
+        top_k=top_k,
+        max_new_entries=max_new_entries,
+        regime_config=regime_config,
+        cluster_gate=None,
+        rank_exit_threshold=rank_exit_threshold,
+        exchange_info=exchange_info,
+    )
+    entries = _entry_regime_for_training(
+        trades=pd.DataFrame(trades),
+        equity=pd.DataFrame(equity),
+        regime_features=scored,
+    )
+    return train_cluster_regime_gate(entries, config), scored
+
+
+def _os_scored_with_regime_features(cluster_scored: pd.DataFrame, os_scored: pd.DataFrame) -> pd.DataFrame:
+    if os_scored.empty:
+        return os_scored
+    os_times = set(os_scored["open_time"].dropna().astype(int))
+    combined = pd.concat([cluster_scored, os_scored], ignore_index=True) if not cluster_scored.empty else os_scored
+    regime = add_decision_time_regime_features(combined)
+    return regime[regime["open_time"].astype(int).isin(os_times)].copy()
+
+
+def _simulate_scored_window(
+    scored: pd.DataFrame,
+    *,
+    fold: int | str,
+    initial_cash: float,
+    position_fraction: float,
+    take_profit: float,
+    stop_loss: float,
+    fee_bps: float,
+    slippage_bps: float,
+    max_positions: int,
+    top_k: int | None,
+    max_new_entries: int | None,
+    regime_config: RegimeThrottleConfig | None,
+    cluster_gate: ClusterRegimeGate | None,
+    rank_exit_threshold: int | None,
+    exchange_info: dict | None,
+    portfolio: Portfolio | None = None,
+    executor: SimulatedExecutor | None = None,
+    liquidate_at_end: bool = True,
+    final_liquidation_timestamp: int | str = "fold_end",
+) -> tuple[list[dict], list[dict], list[dict]]:
+    if portfolio is None:
+        portfolio = Portfolio(initial_cash=initial_cash, fee_bps=fee_bps)
+    if executor is None:
+        executor = SimulatedExecutor(
+            portfolio,
+            exchange_info=exchange_info,
+            slippage_bps=slippage_bps,
+        )
+    elif executor.portfolio is not portfolio:
+        raise ValueError("executor must reference the provided portfolio")
+    equity_rows: list[dict] = []
+    trade_rows: list[dict] = []
+    gate_rows: list[dict] = []
+
+    for open_time, bar in scored.sort_values(["open_time", "pair"]).groupby(
+        "open_time",
+        observed=True,
+    ):
+        timestamp = bar["timestamp"].iloc[0]
+        prices = {
+            str(row.pair): float(row.close)
+            for row in bar[["pair", "close"]].itertuples(index=False)
+            if pd.notna(row.close) and float(row.close) > 0
+        }
+
+        equity_value = portfolio.value(prices)
+        cycle = build_cycle_intents(
+            bar,
+            portfolio.positions,
+            prices,
+            portfolio_value=equity_value,
+            available_cash=portfolio.cash,
+            position_fraction=position_fraction,
+            max_positions=max_positions,
+            top_k=top_k,
+            max_new_entries=max_new_entries,
+            regime_config=regime_config,
+            cluster_gate=cluster_gate,
+            rank_exit_threshold=rank_exit_threshold,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+        for decision in cycle.entry_gate_decisions:
+            gate_rows.append(
+                {
+                    "fold": fold,
+                    "open_time": open_time,
+                    "timestamp": timestamp,
+                    **decision,
+                }
+            )
+
+        for intent in cycle.exits:
+            executor.set_context(timestamp=open_time, reason=intent.reason)
+            before = len(executor.events)
+            executor.sell(intent.pair, intent.quantity, prices[intent.pair], use_limit=False)
+            if len(executor.events) > before:
+                executor.events[-1]["fold"] = fold
+                _add_regime_event_fields(executor.events[-1], cycle.regime)
+                trade_rows.append(executor.events[-1])
+
+        for intent in cycle.entries:
+            executor.set_context(
+                timestamp=open_time,
+                score=intent.score,
+                reason=intent.reason,
+            )
+            before = len(executor.events)
+            executor.buy(intent.pair, intent.notional_usd, prices[intent.pair], use_limit=False)
+            if len(executor.events) > before:
+                executor.events[-1]["fold"] = fold
+                _add_regime_event_fields(executor.events[-1], cycle.regime)
+                _add_cluster_event_fields(executor.events[-1], intent)
+                trade_rows.append(executor.events[-1])
+
+        equity_after = portfolio.value(prices)
+        regime_fields = _equity_regime_fields(cycle.regime)
+        equity_rows.append(
+            {
+                "fold": fold,
+                "open_time": open_time,
+                "timestamp": timestamp,
+                "equity": equity_after,
+                "cash": portfolio.cash,
+                "positions": len(portfolio.positions),
+                "cluster_gate_enabled": cluster_gate is not None,
+                "cluster_gate_checked": len(cycle.entry_gate_decisions),
+                "cluster_gate_blocked": sum(
+                    not bool(row.get("cluster_gate_allowed")) for row in cycle.entry_gate_decisions
+                ),
+                **regime_fields,
+            }
+        )
+
+    if liquidate_at_end:
+        final_prices = (
+            scored.sort_values("open_time")
+            .groupby("pair", observed=True)["close"]
+            .last()
+            .dropna()
+            .astype(float)
+            .to_dict()
+        )
+        for pair in list(portfolio.positions):
+            price = final_prices.get(pair)
+            if price is None:
+                continue
+            executor.set_context(timestamp=final_liquidation_timestamp, reason="fold_end")
+            before = len(executor.events)
+            executor.sell(pair, portfolio.positions[pair].quantity, price, use_limit=False)
+            if len(executor.events) > before:
+                executor.events[-1]["fold"] = fold
+                _add_regime_event_fields(executor.events[-1], None)
+                trade_rows.append(executor.events[-1])
+    return equity_rows, trade_rows, gate_rows
+
+
+def _entry_regime_for_training(
+    *,
+    trades: pd.DataFrame,
+    equity: pd.DataFrame,
+    regime_features: pd.DataFrame,
+) -> pd.DataFrame:
+    from bot.backtest.regime_diagnostics import entry_regime_frame, pair_trade_entries
+
+    if trades.empty:
+        return pd.DataFrame()
+    entries = pair_trade_entries(trades, equity)
+    return entry_regime_frame(entries, regime_features)
+
+
+def _tag_cluster_frame(frame: pd.DataFrame, fold: int) -> pd.DataFrame:
+    out = frame.copy()
+    out.insert(0, "fold", fold)
+    return out
 
 
 def write_outputs(
@@ -254,10 +451,22 @@ def write_outputs(
     summary.to_csv(output_dir / f"{prefix}_summary.csv", index=False)
     equity.to_csv(output_dir / f"{prefix}_equity.csv", index=False)
     trades.to_csv(output_dir / f"{prefix}_trades.csv", index=False)
+    _write_optional_cluster_reports(summary, output_dir, prefix)
     (output_dir / f"{prefix}_metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True, default=str),
         encoding="utf-8",
     )
+
+
+def _write_optional_cluster_reports(summary: pd.DataFrame, output_dir: Path, prefix: str) -> None:
+    for attr_name, suffix in (
+        ("cluster_gate_decisions", "cluster_gate_decisions"),
+        ("cluster_gate_summary", "cluster_gate_summary"),
+        ("cluster_gate_profiles", "cluster_gate_profiles"),
+    ):
+        frame = summary.attrs.get(attr_name)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            frame.to_csv(output_dir / f"{prefix}_{suffix}.csv", index=False)
 
 
 def _equity_regime_fields(regime) -> dict[str, object]:
@@ -283,6 +492,18 @@ def _equity_regime_fields(regime) -> dict[str, object]:
 def _add_regime_event_fields(event: dict, regime) -> None:
     fields = _equity_regime_fields(regime)
     event.update(fields)
+
+
+def _add_cluster_event_fields(event: dict, intent) -> None:
+    event.update(
+        {
+            "cluster_gate_enabled": bool(getattr(intent, "cluster_gate_enabled", False)),
+            "cluster_gate_allowed": getattr(intent, "cluster_gate_allowed", None),
+            "cluster_id": getattr(intent, "cluster_id", None),
+            "cluster_distance": getattr(intent, "cluster_distance", None),
+            "cluster_reason": getattr(intent, "cluster_reason", None),
+        }
+    )
 
 
 def _fold_regime_summary(equity_rows: list[dict], fold: int) -> dict[str, float | int]:
@@ -315,6 +536,29 @@ def _fold_trade_summary(exits: list[dict]) -> dict[str, float | int]:
         "avg_stopped_loss_pct": _mean_pct(row.get("return_pct") for row in stop_exits),
         "mean_holding_hours": float(np.mean(holding_hours)) if holding_hours else np.nan,
         "median_holding_hours": float(np.median(holding_hours)) if holding_hours else np.nan,
+    }
+
+
+def _fold_cluster_gate_summary(
+    gate_decision_rows: list[dict],
+    fold: int,
+    cluster_gate: ClusterRegimeGate | None,
+) -> dict[str, float | int | bool | str]:
+    rows = [row for row in gate_decision_rows if row.get("fold") == fold]
+    allowed = [bool(row.get("cluster_gate_allowed")) for row in rows]
+    return {
+        "cluster_gate_enabled": cluster_gate is not None,
+        "cluster_allowed_clusters": (
+            ",".join(str(cluster_id) for cluster_id in sorted(cluster_gate.allowed_clusters))
+            if cluster_gate is not None
+            else ""
+        ),
+        "cluster_training_average_return": (
+            float(cluster_gate.training_average_return) if cluster_gate is not None else np.nan
+        ),
+        "cluster_gate_checks": len(rows),
+        "cluster_gate_allowed_checks": int(sum(allowed)),
+        "cluster_gate_blocked_checks": int(len(rows) - sum(allowed)),
     }
 
 
@@ -389,6 +633,15 @@ def main() -> int:
     parser.add_argument("--regime-lookback-bars", type=int, default=720)
     parser.add_argument("--regime-percentile", type=float, default=0.80)
     parser.add_argument("--regime-min-history-bars", type=int, default=168)
+    parser.add_argument(
+        "--cluster-regime-gate",
+        action="store_true",
+        help="Block entries unless they match historically profitable learned regime clusters.",
+    )
+    parser.add_argument("--cluster-lookback-months", type=int, default=24)
+    parser.add_argument("--cluster-n-clusters", type=int, default=4)
+    parser.add_argument("--cluster-min-trades", type=int, default=50)
+    parser.add_argument("--cluster-random-seed", type=int, default=42)
     args = parser.parse_args()
 
     feature_path = Path(args.features)
@@ -403,6 +656,16 @@ def main() -> int:
             min_history_bars=args.regime_min_history_bars,
         )
         if args.regime_throttle
+        else None
+    )
+    cluster_gate_config = (
+        ClusterRegimeGateConfig(
+            n_clusters=args.cluster_n_clusters,
+            min_cluster_trades=args.cluster_min_trades,
+            lookback_months=args.cluster_lookback_months,
+            random_seed=args.cluster_random_seed,
+        )
+        if args.cluster_regime_gate
         else None
     )
     summary, equity, trades = run_portfolio_backtest(
@@ -424,6 +687,7 @@ def main() -> int:
         top_k=args.top_k,
         max_new_entries=args.max_new_entries,
         regime_config=regime_config,
+        cluster_gate_config=cluster_gate_config,
         rank_exit_threshold=args.rank_exit_threshold,
     )
     metadata = {
@@ -450,6 +714,11 @@ def main() -> int:
         "regime_lookback_bars": args.regime_lookback_bars,
         "regime_percentile": args.regime_percentile,
         "regime_min_history_bars": args.regime_min_history_bars,
+        "cluster_regime_gate": args.cluster_regime_gate,
+        "cluster_lookback_months": args.cluster_lookback_months,
+        "cluster_n_clusters": args.cluster_n_clusters,
+        "cluster_min_trades": args.cluster_min_trades,
+        "cluster_random_seed": args.cluster_random_seed,
         "rows": int(len(frame)),
         "pairs": int(frame["pair"].nunique()),
         "pair_filter": list(selected_pairs) if selected_pairs is not None else "all",

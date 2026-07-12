@@ -44,6 +44,7 @@ BINANCE_FALLBACK_URLS = _csv_env(
 # --- Local storage/logging ---
 DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data" / "candles")))
 LOG_DIR = Path(os.getenv("LOG_DIR", str(PROJECT_ROOT / "logs")))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", str(PROJECT_ROOT / "data" / "models")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_CONSOLE = os.getenv("BOT_LOG_CONSOLE", "1").strip().lower() not in {
     "0",
@@ -70,6 +71,12 @@ LIVE_MIN_HISTORY_BARS = int(os.getenv("LIVE_MIN_HISTORY_BARS", "200"))
 LIVE_TOP_K = int(os.getenv("LIVE_TOP_K", "0"))
 LIVE_MAX_NEW_ENTRIES = int(os.getenv("LIVE_MAX_NEW_ENTRIES", "0"))
 LIVE_MAX_POSITIONS = int(os.getenv("LIVE_MAX_POSITIONS", "0"))
+
+# --- Research/live model window policy ---
+RIDGE_TRAIN_MONTHS = int(os.getenv("RIDGE_TRAIN_MONTHS", "3"))
+RIDGE_REFIT_DAYS = int(os.getenv("RIDGE_REFIT_DAYS", "7"))
+REGIME_TRAIN_MONTHS = int(os.getenv("REGIME_TRAIN_MONTHS", "24"))
+REGIME_REFIT_DAYS = int(os.getenv("REGIME_REFIT_DAYS", "30"))
 
 # Keep the old 43-coin universe available as a starting point. New strategy work
 # should test any narrower universe explicitly before trading it live.

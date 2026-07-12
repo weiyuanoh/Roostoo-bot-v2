@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from collections.abc import Iterable
 from pathlib import Path
 
+import pandas as pd
+
 from bot.binance_data import BinanceData
 from bot.config import (
     DATA_DIR,
@@ -23,9 +25,13 @@ from bot.config import (
     LIVE_STOP_LOSS,
     LIVE_TAKE_PROFIT,
     LIVE_TOP_K,
+    MODEL_DIR,
+    REGIME_TRAIN_MONTHS,
+    RIDGE_TRAIN_MONTHS,
     TRADEABLE_COINS,
 )
 from bot.data_store import CandleStore
+from bot.live_models import train_live_artifacts
 from bot.live_trader import RidgeLiveConfig, RidgeLiveTrader
 from bot.liquidate import liquidate_positions
 from bot.live_state import LiveState
@@ -43,7 +49,8 @@ from bot.monitoring import (
 )
 from bot.roostoo_client import RoostooClient
 from bot.scheduler import next_hour_boundary, sleep_until
-from bot.strategy.regime import RegimeThrottleConfig
+from bot.strategy.regime import ClusterRegimeGateConfig, RegimeThrottleConfig
+from bot.strategy.ridge import build_feature_frame
 
 
 def parse_pairs(raw: str | None) -> list[str]:
@@ -71,6 +78,52 @@ def collect_candles(
         path = store.append_csv(pair, interval, candles)
         results.append((pair, len(candles), str(path)))
     return results
+
+
+def collect_candles_paginated(
+    pairs: Iterable[str],
+    interval: str,
+    start: str,
+    end: str,
+    output_dir=DATA_DIR,
+    sleep_seconds: float = 0.1,
+) -> list[tuple[str, int, str]]:
+    feed = BinanceData()
+    store = CandleStore(output_dir)
+    start_time = _parse_utc_ms(start)
+    end_time = _parse_utc_ms(end)
+    results: list[tuple[str, int, str]] = []
+    for pair in pairs:
+        candles = feed.fetch_klines_paginated(
+            pair,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+            sleep_seconds=sleep_seconds,
+        )
+        if not candles:
+            results.append((pair, 0, ""))
+            continue
+        path = store.append_csv(pair, interval, candles)
+        results.append((pair, len(candles), str(path)))
+    return results
+
+
+def build_features_from_store(
+    pairs: Iterable[str],
+    interval: str,
+    input_dir: str | Path,
+    output: str | Path,
+) -> Path:
+    store = CandleStore(Path(input_dir))
+    candles = store.read_many(tuple(pairs), interval)
+    if candles.empty:
+        raise RuntimeError("no stored candles found for requested pairs")
+    features = build_feature_frame(candles)
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    features.to_csv(output_path, index=False)
+    return output_path
 
 
 def smoke() -> int:
@@ -108,6 +161,15 @@ def _parse_alphas(raw: str) -> tuple[float, ...]:
     return tuple(float(item.strip()) for item in raw.split(",") if item.strip())
 
 
+def _parse_utc_ms(value: str) -> int:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return int(timestamp.timestamp() * 1000)
+
+
 def _live_config(args: argparse.Namespace) -> RidgeLiveConfig:
     take_profit = args.tp
     stop_loss = args.sl
@@ -129,6 +191,8 @@ def _live_config(args: argparse.Namespace) -> RidgeLiveConfig:
         max_positions_override=_positive_or_none(args.max_positions),
         regime_config=_regime_config(args),
         state_path=Path(args.state_path),
+        model_dir=Path(args.model_dir) if args.model_dir else None,
+        cluster_regime_gate=args.cluster_regime_gate,
     )
 
 
@@ -171,6 +235,62 @@ def live_once(args: argparse.Namespace) -> int:
             regime=_format_regime(result.get("regime")),
         )
     )
+    return 0
+
+
+def build_features(args: argparse.Namespace) -> int:
+    try:
+        path = build_features_from_store(
+            parse_pairs(args.pairs),
+            args.interval,
+            args.input_dir,
+            args.output,
+        )
+    except RuntimeError as exc:
+        print(f"build-features failed: {exc}", flush=True)
+        return 1
+    print(path)
+    return 0
+
+
+def train_live_models(args: argparse.Namespace) -> int:
+    take_profit = args.tp if args.exit_threshold is None else args.exit_threshold
+    stop_loss = args.sl if args.exit_threshold is None else args.exit_threshold
+    trading_params = {
+        "initial_cash": args.initial_cash,
+        "position_fraction": args.position_fraction,
+        "take_profit": take_profit,
+        "stop_loss": stop_loss,
+        "fee_bps": args.fee_bps,
+        "slippage_bps": args.slippage_bps,
+        "max_positions": args.max_positions,
+        "top_k": _positive_or_none(args.top_k),
+        "max_new_entries": _positive_or_none(args.max_new_entries),
+    }
+    try:
+        paths = train_live_artifacts(
+            feature_path=args.features,
+            pairs=tuple(parse_pairs(args.pairs)),
+            model_dir=args.model_dir,
+            model=args.model,
+            horizon=args.horizon,
+            ridge_train_months=args.ridge_train_months,
+            regime_train_months=args.regime_train_months,
+            ridge_alphas=_parse_alphas(args.ridge_alphas),
+            cluster_config=ClusterRegimeGateConfig(
+                n_clusters=args.cluster_n_clusters,
+                min_cluster_trades=args.cluster_min_trades,
+                lookback_months=args.regime_train_months,
+                random_seed=args.cluster_random_seed,
+            ),
+            trading_params=trading_params,
+            as_of=pd.Timestamp(args.as_of) if args.as_of else None,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"train-live-models failed: {exc}", flush=True)
+        return 1
+    for name, path in paths.items():
+        print(f"{name}: {path}")
     return 0
 
 
@@ -267,6 +387,16 @@ def add_live_args(parser: argparse.ArgumentParser) -> None:
         help="Deprecated: set both --tp and --sl to the same value.",
     )
     parser.add_argument("--state-path", default=str(LIVE_STATE_PATH))
+    parser.add_argument(
+        "--model-dir",
+        default=None,
+        help="Load persisted ridge/regime artifacts from this directory instead of training on startup.",
+    )
+    parser.add_argument(
+        "--cluster-regime-gate",
+        action="store_true",
+        help="Use the persisted learned regime cluster gate from --model-dir.",
+    )
     parser.add_argument(
         "--execute",
         action="store_true",
@@ -418,6 +548,44 @@ def main() -> int:
     collect.add_argument("--limit", type=int, default=1000, help="Candles per pair, max 1000 per request")
     collect.add_argument("--output-dir", default=str(DATA_DIR), help="Directory for candle CSV files")
 
+    collect_history = subparsers.add_parser("collect-history", help="Collect paginated Binance candles")
+    collect_history.add_argument("--pairs", default="BTC/USD,ETH/USD,SOL/USD", help="Comma list or 'all'")
+    collect_history.add_argument("--interval", default="1h")
+    collect_history.add_argument("--start", required=True, help="UTC start date/time, e.g. 2024-07-01")
+    collect_history.add_argument("--end", required=True, help="UTC end date/time, e.g. 2026-07-01")
+    collect_history.add_argument("--output-dir", default=str(DATA_DIR))
+    collect_history.add_argument("--sleep-seconds", type=float, default=0.1)
+
+    features = subparsers.add_parser("build-features", help="Build strategy features from stored candles")
+    features.add_argument("--pairs", default="all", help="Comma list or 'all'")
+    features.add_argument("--interval", default="1h")
+    features.add_argument("--input-dir", default=str(DATA_DIR))
+    features.add_argument("--output", required=True)
+
+    train_models = subparsers.add_parser("train-live-models", help="Train persisted live ridge/regime artifacts")
+    train_models.add_argument("--features", required=True)
+    train_models.add_argument("--pairs", default="all")
+    train_models.add_argument("--model-dir", default=str(MODEL_DIR))
+    train_models.add_argument("--as-of", default=None, help="UTC cutoff; defaults to latest feature timestamp")
+    train_models.add_argument("--model", default=LIVE_MODEL)
+    train_models.add_argument("--horizon", type=int, default=LIVE_FORWARD_HORIZON)
+    train_models.add_argument("--ridge-train-months", type=int, default=RIDGE_TRAIN_MONTHS)
+    train_models.add_argument("--regime-train-months", type=int, default=REGIME_TRAIN_MONTHS)
+    train_models.add_argument("--ridge-alphas", default="0.1,1,10,100")
+    train_models.add_argument("--initial-cash", type=float, default=1_000_000.0)
+    train_models.add_argument("--position-fraction", type=float, default=LIVE_POSITION_FRACTION)
+    train_models.add_argument("--top-k", type=int, default=LIVE_TOP_K or 1)
+    train_models.add_argument("--max-new-entries", type=int, default=LIVE_MAX_NEW_ENTRIES or 1)
+    train_models.add_argument("--max-positions", type=int, default=LIVE_MAX_POSITIONS or 3)
+    train_models.add_argument("--tp", type=float, default=LIVE_TAKE_PROFIT)
+    train_models.add_argument("--sl", type=float, default=LIVE_STOP_LOSS)
+    train_models.add_argument("--exit-threshold", type=float, default=None)
+    train_models.add_argument("--fee-bps", type=float, default=10.0)
+    train_models.add_argument("--slippage-bps", type=float, default=5.0)
+    train_models.add_argument("--cluster-n-clusters", type=int, default=4)
+    train_models.add_argument("--cluster-min-trades", type=int, default=50)
+    train_models.add_argument("--cluster-random-seed", type=int, default=42)
+
     live_once_parser = subparsers.add_parser("live-once", help="Run one live ridge cycle; dry-run by default")
     add_live_args(live_once_parser)
 
@@ -479,6 +647,23 @@ def main() -> int:
             status = path if path else "failed"
             print(f"{pair}: {count} candles -> {status}")
         return 0 if all(count > 0 for _, count, _ in results) else 1
+    if args.command == "collect-history":
+        results = collect_candles_paginated(
+            parse_pairs(args.pairs),
+            args.interval,
+            args.start,
+            args.end,
+            args.output_dir,
+            sleep_seconds=args.sleep_seconds,
+        )
+        for pair, count, path in results:
+            status = path if path else "failed"
+            print(f"{pair}: {count} candles -> {status}")
+        return 0 if all(count > 0 for _, count, _ in results) else 1
+    if args.command == "build-features":
+        return build_features(args)
+    if args.command == "train-live-models":
+        return train_live_models(args)
     if args.command == "live-once":
         return live_once(args)
     if args.command == "live":

@@ -8,7 +8,7 @@ from bot.backtest.rank_decay_exit_experiment import (
 )
 from bot.backtest.ridge_score_portfolio import filter_pairs, run_portfolio_backtest
 from bot.strategy.ridge import DEFAULT_FEATURE_PATH
-from bot.strategy.regime import RegimeThrottleConfig
+from bot.strategy.regime import ClusterRegimeGateConfig, RegimeThrottleConfig, train_cluster_regime_gate
 
 
 def test_portfolio_buy_sell_updates_cash_and_realized_pnl():
@@ -270,6 +270,8 @@ def test_rank_decay_experiment_default_universe_has_30_pairs():
 
 
 def test_rank_decay_experiment_fixed_pairs_exist_in_feature_frame():
+    if not DEFAULT_FEATURE_PATH.exists():
+        pytest.skip(f"{DEFAULT_FEATURE_PATH} is not installed locally")
     frame = pd.read_csv(DEFAULT_FEATURE_PATH, usecols=["pair"])
 
     assert set(FIXED_TOP30_PAIRS) <= set(frame["pair"].unique())
@@ -373,4 +375,89 @@ def test_ridge_portfolio_backtest_regime_throttle_blocks_buys_on_stress():
     assert "stressed_hours" in summary.columns
     assert equity["regime_stressed"].any()
     assert summary["blocked_entry_hours"].iloc[0] > 0
+    assert trades.empty or not trades["side"].eq("BUY").any()
+
+
+def test_cluster_regime_gate_training_selects_profitable_clusters():
+    rows = []
+    for idx in range(80):
+        rows.append(
+            {
+                "entry_score": 1.0 if idx < 40 else -1.0,
+                "score_gap_rank1_rank2": 0.1 if idx < 40 else 0.01,
+                "score_gap_rank1_median": 0.2 if idx < 40 else 0.02,
+                "score_gap_rank1_rank2_trailing_median": 0.03,
+                "pair_return_1h_known": 0.0,
+                "universe_breadth_1h": 0.5,
+                "universe_return_1h": 0.0,
+                "universe_volatility_1h": 0.01,
+                "pair_top3_count_3h": 3.0 if idx < 40 else 1.0,
+                "pair_top3_count_6h": 6.0 if idx < 40 else 1.0,
+                "pair_top3_count_12h": 9.0 if idx < 40 else 1.0,
+                "pair_rank1_count_3h": 3.0 if idx < 40 else 1.0,
+                "pair_rank1_count_6h": 5.0 if idx < 40 else 1.0,
+                "pair_rank1_count_12h": 8.0 if idx < 40 else 1.0,
+                "positions_at_entry": 1.0,
+                "return_pct": 0.02 if idx < 40 else -0.02,
+                "pnl": 20.0 if idx < 40 else -20.0,
+            }
+        )
+
+    gate = train_cluster_regime_gate(
+        pd.DataFrame(rows),
+        ClusterRegimeGateConfig(n_clusters=2, min_cluster_trades=10, random_seed=1),
+    )
+
+    assert gate.allowed_clusters
+    assert gate.cluster_summary["allowed"].any()
+
+
+def test_cluster_regime_gate_blocks_entries_when_no_cluster_is_allowed():
+    rows = []
+    timestamps = pd.date_range("2025-01-01", periods=24 * 95, freq="h", tz="UTC")
+    pairs = [f"P{idx}/USD" for idx in range(8)]
+    for timestamp in timestamps:
+        for p_idx, pair in enumerate(pairs):
+            rows.append(
+                {
+                    "open_time": int(timestamp.timestamp() * 1000),
+                    "timestamp": timestamp,
+                    "pair": pair,
+                    "close": 100.0 + p_idx,
+                    "target_z": float(p_idx),
+                    "z_momentum": float(p_idx),
+                    "z_low_roll_impact": 0.0,
+                    "z_momentum_x_low_roll_impact": 0.0,
+                    "forward_return_1": float(p_idx),
+                }
+            )
+    frame = pd.DataFrame(rows)
+
+    summary, equity, trades = run_portfolio_backtest(
+        frame,
+        model="momentum_only",
+        horizon=1,
+        is_months=1,
+        os_months=1,
+        step_months=1,
+        ridge_alphas=(1.0,),
+        initial_cash=10_000.0,
+        position_fraction=0.25,
+        take_profit=10.0,
+        stop_loss=10.0,
+        fee_bps=0.0,
+        max_positions=1,
+        top_k=1,
+        max_new_entries=1,
+        cluster_gate_config=ClusterRegimeGateConfig(
+            n_clusters=2,
+            min_cluster_trades=10_000,
+            lookback_months=2,
+            random_seed=1,
+        ),
+    )
+
+    assert summary["cluster_gate_enabled"].any()
+    assert summary["cluster_gate_blocked_checks"].sum() > 0
+    assert equity["cluster_gate_blocked"].sum() > 0
     assert trades.empty or not trades["side"].eq("BUY").any()

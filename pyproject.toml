@@ -1,7 +1,7 @@
 [project]
 name = "roostoo-bot"
-version = "0.1.0"
-description = "Market Microstructure Crypto Bot"
+version = "0.2.0"
+description = "Momentum refit-policy crypto trading bot"
 readme = "README.md"
 authors = [
     {name = "weiyuanoh"}
@@ -29,3 +29,6 @@ dev = [
     "ruff (>=0.15.14,<0.16.0)",
     "ipykernel (>=7.2.0,<8.0.0)"
 ]
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

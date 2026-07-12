@@ -30,6 +30,7 @@ from bot.executor import Executor
 from bot.live_state import LivePositionState, LiveState
 from bot.logger import get_logger, log_jsonl
 from bot.roostoo_client import RoostooClient
+from bot.model_store import load_cluster_gate, load_ridge_selection
 from bot.telemetry import (
     closed_trade_record,
     log_closed_trade,
@@ -45,10 +46,11 @@ from bot.strategy.ridge import (
     build_cycle_intents,
     build_feature_frame,
     latest_scores,
+    score_frame,
     score_ranks,
     select_ridge_model,
 )
-from bot.strategy.regime import RegimeThrottleConfig, add_roll_impact_regime
+from bot.strategy.regime import ClusterRegimeGate, RegimeThrottleConfig, add_decision_time_regime_features, add_roll_impact_regime
 
 log = get_logger("live_trader")
 
@@ -70,6 +72,8 @@ class RidgeLiveConfig:
     regime_config: RegimeThrottleConfig | None = None
     min_history_bars: int = LIVE_MIN_HISTORY_BARS
     state_path: Path = LIVE_STATE_PATH
+    model_dir: Path | None = None
+    cluster_regime_gate: bool = False
 
     @property
     def max_positions(self) -> int:
@@ -90,6 +94,8 @@ class RidgeLiveConfig:
             raise ValueError("max_new_entries must be positive when set")
         if self.max_positions_override is not None and self.max_positions_override <= 0:
             raise ValueError("max_positions_override must be positive when set")
+        if self.cluster_regime_gate and self.model_dir is None:
+            raise ValueError("cluster_regime_gate requires model_dir")
 
 
 class RidgeLiveTrader:
@@ -109,6 +115,9 @@ class RidgeLiveTrader:
         self.state = state
         self.config = config
         self.selection: RidgeSelection | None = None
+        self.selection_metadata: dict[str, Any] = {}
+        self.cluster_gate: ClusterRegimeGate | None = None
+        self.cluster_gate_metadata: dict[str, Any] = {}
 
     @classmethod
     def from_clients(
@@ -132,6 +141,20 @@ class RidgeLiveTrader:
 
     def initialize(self) -> RidgeSelection:
         """Fetch recent candles and fit the ridge score used by live cycles."""
+        if self.config.model_dir is not None:
+            self.selection, self.selection_metadata = load_ridge_selection(self.config.model_dir)
+            if self.config.cluster_regime_gate:
+                self.cluster_gate, self.cluster_gate_metadata = load_cluster_gate(self.config.model_dir)
+            log.info(
+                "Loaded live ridge model=%s alpha=%s terms=%s train_start=%s train_end=%s",
+                self.selection.model,
+                self.selection.alpha,
+                ",".join(self.selection.terms),
+                self.selection_metadata.get("train_start"),
+                self.selection_metadata.get("train_end"),
+            )
+            return self.selection
+
         candles = self.fetch_history_frame()
         features = build_feature_frame(candles)
         train = add_training_target(features, horizon=self.config.horizon)
@@ -178,6 +201,12 @@ class RidgeLiveTrader:
         features = build_feature_frame(source)
         if self.config.regime_config is not None:
             features = add_roll_impact_regime(features, self.config.regime_config)
+        if self.cluster_gate is not None:
+            scored = score_frame(features, self.selection.terms, self.selection.beta, score_col="ridge_score")
+            scored = add_decision_time_regime_features(scored)
+            latest_time = scored["open_time"].max()
+            latest = scored[scored["open_time"].eq(latest_time)].copy()
+            return latest.sort_values("ridge_score", ascending=False, na_position="last")
         return latest_scores(features, self.selection)
 
     def run_cycle(self, *, execute: bool = False) -> dict[str, Any]:
@@ -212,6 +241,7 @@ class RidgeLiveTrader:
             top_k=self.config.top_k,
             max_new_entries=self.config.max_new_entries,
             regime_config=self.config.regime_config,
+            cluster_gate=self.cluster_gate,
             take_profit=self.config.take_profit,
             stop_loss=self.config.stop_loss,
         )
@@ -226,6 +256,12 @@ class RidgeLiveTrader:
             "max_positions": self.config.max_positions,
             "position_fraction": self.config.position_fraction,
             "execute": execute,
+            "ridge_model_trained_at": self.selection_metadata.get("as_of"),
+            "ridge_train_start": self.selection_metadata.get("train_start"),
+            "ridge_train_end": self.selection_metadata.get("train_end"),
+            "regime_model_trained_at": self.cluster_gate_metadata.get("as_of"),
+            "regime_train_start": self.cluster_gate_metadata.get("train_start"),
+            "regime_train_end": self.cluster_gate_metadata.get("train_end"),
         }
         log_score_snapshot(
             cycle_id=cycle_id,
@@ -254,6 +290,13 @@ class RidgeLiveTrader:
             "max_new_entries": self.config.max_new_entries,
             "max_positions": self.config.max_positions,
             "regime": cycle.regime.__dict__ if cycle.regime is not None else None,
+            "cluster_gate": {
+                "enabled": self.cluster_gate is not None,
+                "trained_at": self.cluster_gate_metadata.get("as_of"),
+                "train_start": self.cluster_gate_metadata.get("train_start"),
+                "train_end": self.cluster_gate_metadata.get("train_end"),
+                "allowed_clusters": sorted(self.cluster_gate.allowed_clusters) if self.cluster_gate else [],
+            },
             "entries": [intent.__dict__ for intent in entries],
             "exits": [intent.__dict__ for intent in exits],
             "orders": [],

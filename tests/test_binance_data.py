@@ -90,3 +90,30 @@ def test_fetch_klines_unknown_pair_returns_none():
 
     assert client.fetch_klines("UNKNOWN/USD") is None
 
+
+def test_fetch_klines_paginated_advances_start_time():
+    session = FakeSession(
+        [
+            FakeResponse(
+                [
+                    [1000, "1", "1", "1", "1", "1", 1999],
+                    [2000, "2", "2", "2", "2", "2", 2999],
+                ]
+            ),
+            FakeResponse([[3000, "3", "3", "3", "3", "3", 3999]]),
+        ]
+    )
+    client = BinanceData(base_urls=["https://example.test"], session=session)
+
+    candles = client.fetch_klines_paginated(
+        "BTC/USD",
+        interval="1h",
+        start_time=1000,
+        end_time=5000,
+        limit=2,
+        sleep_seconds=0,
+    )
+
+    assert [candle["open_time"] for candle in candles or []] == [1000, 2000, 3000]
+    assert session.calls[0][1]["params"]["startTime"] == 1000
+    assert session.calls[1][1]["params"]["startTime"] == 2001
