@@ -225,6 +225,7 @@ def load_model_frame(
     horizon: int = DEFAULT_HORIZON,
 ) -> pd.DataFrame:
     df = pd.read_csv(feature_path)
+    df = normalize_time(df)
     df = add_ridge_signals(df)
     df = add_training_target(df, horizon=horizon)
     return df.sort_values(["pair", "timestamp"]).reset_index(drop=True)

@@ -202,6 +202,17 @@ def run_refit_policy_backtest(
         regime_refit_months=regime_refit_months,
         scheduled=policy == "scheduled",
     )
+    if policy == "baseline":
+        segments = [
+            RefitSegment(
+                segment_id=segment.segment_id,
+                start=segment.start,
+                end=segment.end,
+                ridge_refit=segment.ridge_refit,
+                regime_refit=False,
+            )
+            for segment in segments
+        ]
 
     portfolio = Portfolio(initial_cash=initial_cash, fee_bps=fee_bps)
     executor = SimulatedExecutor(portfolio, exchange_info=exchange_info, slippage_bps=slippage_bps)
@@ -622,10 +633,11 @@ def main() -> int:
     comparison = []
     try:
         for label, policy, gate_config in (
-            ("baseline", "baseline", None),
-            ("fixed_cluster_gate", "fixed", cluster_config),
-            ("scheduled_cluster_gate", "scheduled", cluster_config),
+            ("v0_no_regime", "baseline", None),
+            ("v1_fixed_regime", "fixed", cluster_config),
+            ("v2_scheduled_refit", "scheduled", cluster_config),
         ):
+            print(f"running {label}...", flush=True)
             summary, equity, trades, segments = run_refit_policy_backtest(
                 frame,
                 policy=policy,
