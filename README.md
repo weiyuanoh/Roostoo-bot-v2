@@ -6,42 +6,46 @@ Research and live-trading environment for a long-only crypto spot bot that:
 - collects live market data from Binance public spot klines
 - centralizes feature, scoring, risk, and execution infrastructure so notebooks, backtests, and live trading do not drift
 
-## Current Research Hypothesis
+## Current Live Deployment
 
-The current deployment-style question is whether scheduled live refitting
-improves the same two-month out-of-sample trading window versus a fully fixed
-deployment.
+Research is paused. The current live policy is the V1 fixed-regime deployment:
+train one ridge artifact on the latest 3 months, train one learned cluster
+regime gate on the latest 24 months, then trade live from those saved artifacts
+without automatic refit promotion.
 
-Both variants use the fixed top-30 USD universe, `momentum_only` ridge score,
-and TP/SL exits. The comparison must use one canonical long feature file:
+The canonical feature file is:
 
 ```text
 data/features/live_1h_features_30m.csv
 ```
 
-V1 freezes ridge and regime artifacts for the whole OOS window:
+V1 freezes ridge and regime artifacts:
 
 ```text
 ridge train:  T - 3 months  -> T
 regime train: T - 24 months -> T
-trade:        T             -> T + 2 months
+live trade:   use saved artifacts until explicitly replaced
 ```
 
-V2 trades the same OOS window but refits on a live schedule without closing
-positions at refit boundaries:
+The rejected scheduled-refit candidate was:
 
 ```text
 ridge refit:  every 7 days, using refit_time - 3 months -> refit_time
 regime refit: every 1 month, using refit_time - 24 months -> refit_time
-trade:        same T -> T + 2 months OOS window as V1
+deploy:       immediately replace active artifacts after each refit
 ```
+
+The 10-fold walk-forward panel showed that scheduled refitting traded more but
+did not improve risk-adjusted results. V1 mostly won by staying out of bad
+regimes, so live deployment should prioritize capital preservation and avoid
+automatic model replacement.
 
 Rank-decay exits and direct Roll-impact alpha overlays did not beat the plain
 TP/SL momentum baseline in prior short-sample studies, so they remain disabled
 unless a future 30-month OOS test shows a clear improvement after costs.
 
 ```text
-universe = fixed_top30_median_dollar_volume
+universe = fixed_25_full_history_pairs
 model = momentum_only
 score = beta_momentum * z_momentum
 horizon = 24
@@ -54,15 +58,17 @@ stop_loss = 0.015
 exits = TP/SL only
 ```
 
-The fixed deployment universe is:
+The fixed deployment universe is the 25-pair full-history set used by the
+strict walk-forward panel:
 
 ```text
-BTC/USD, ETH/USD, SOL/USD, XRP/USD, ZEC/USD, BNB/USD, DOGE/USD, SUI/USD,
-TRX/USD, ADA/USD, PEPE/USD, PAXG/USD, LINK/USD, TAO/USD, AVAX/USD,
-NEAR/USD, LTC/USD, ENA/USD, UNI/USD, WLD/USD, AAVE/USD, HBAR/USD,
-FET/USD, FIL/USD, TRUMP/USD, TON/USD, DOT/USD, ICP/USD, APT/USD,
-VIRTUAL/USD
+AAVE/USD, ADA/USD, APT/USD, AVAX/USD, BNB/USD, BTC/USD, DOGE/USD,
+DOT/USD, ETH/USD, FET/USD, FIL/USD, HBAR/USD, ICP/USD, LINK/USD,
+LTC/USD, NEAR/USD, PAXG/USD, PEPE/USD, SOL/USD, SUI/USD, TRX/USD,
+UNI/USD, WLD/USD, XRP/USD, ZEC/USD
 ```
+
+In CLI commands, `--pairs all` means this deployment universe.
 
 Generated backtest artifacts are intentionally local and disposable. Stale
 short-sample CSV outputs should not be used for the current V1/V2 comparison.
@@ -90,21 +96,22 @@ score = beta_momentum * z_momentum
 
 Any microstructure layer must improve this baseline out-of-sample after fees and realistic slippage, preferably by reducing drawdown, stop-hit rate, bad pair exposure, left-tail losses, or realized slippage without destroying return.
 
-The live strategy can run either:
+The shared scoring code still supports these model specifications for research:
 
 - `momentum_only`
 - `momentum_plus_roll`
 - `momentum_roll_interaction`
 - `momentum_plus_roll_plus_interaction`
 
-The deployment command should explicitly use:
+The deployment profile uses:
 
 ```text
 momentum_only
 ```
 
-The historical default in code may still be configured differently by
-environment variables. Do not rely on implicit defaults for deployment.
+The code defaults, `.env.example`, `train-live-models`, and live commands are
+aligned to this deployment profile. Environment variables can still override
+them, so check `.env` before starting a live process.
 
 The combined score uses:
 
@@ -179,12 +186,12 @@ data/live_state.json
 
 This file is intentionally ignored by git.
 
-Live cycle flow:
+Live cycle flow when saved V1 artifacts are used:
 
 ```text
 1. Fetch recent Binance 1h candles for the configured pair universe.
 2. Compute microstructure, alpha, and ridge score features.
-3. Train the selected ridge model on recent history.
+3. Load the saved ridge and cluster-regime artifacts from `data/models`.
 4. Fetch Roostoo wallet balances and ticker prices.
 5. Reconcile local live state against the Roostoo wallet.
 6. Build exit and entry intents with the shared strategy logic.
@@ -321,7 +328,7 @@ Collect candles to local CSV for backtesting:
 Deployment pair universe:
 
 ```bash
-PAIRS=BTC/USD,ETH/USD,SOL/USD,XRP/USD,ZEC/USD,BNB/USD,DOGE/USD,SUI/USD,TRX/USD,ADA/USD,PEPE/USD,PAXG/USD,LINK/USD,TAO/USD,AVAX/USD,NEAR/USD,LTC/USD,ENA/USD,UNI/USD,WLD/USD,AAVE/USD,HBAR/USD,FET/USD,FIL/USD,TRUMP/USD,TON/USD,DOT/USD,ICP/USD,APT/USD,VIRTUAL/USD
+PAIRS=all
 ```
 
 Dry-run one live cycle:
@@ -329,13 +336,8 @@ Dry-run one live cycle:
 ```bash
 .venv/bin/python -m bot.main live-once \
   --pairs "$PAIRS" \
-  --model momentum_only \
-  --top-k 1 \
-  --max-new-entries 1 \
-  --max-positions 3 \
-  --position-fraction 0.25 \
-  --tp 0.03 \
-  --sl 0.015
+  --model-dir data/models \
+  --cluster-regime-gate
 ```
 
 Execute one live cycle:
@@ -343,13 +345,8 @@ Execute one live cycle:
 ```bash
 .venv/bin/python -m bot.main live-once \
   --pairs "$PAIRS" \
-  --model momentum_only \
-  --top-k 1 \
-  --max-new-entries 1 \
-  --max-positions 3 \
-  --position-fraction 0.25 \
-  --tp 0.03 \
-  --sl 0.015 \
+  --model-dir data/models \
+  --cluster-regime-gate \
   --execute
 ```
 
@@ -358,13 +355,8 @@ Run continuously on the hour:
 ```bash
 .venv/bin/python -m bot.main live \
   --pairs "$PAIRS" \
-  --model momentum_only \
-  --top-k 1 \
-  --max-new-entries 1 \
-  --max-positions 3 \
-  --position-fraction 0.25 \
-  --tp 0.03 \
-  --sl 0.015 \
+  --model-dir data/models \
+  --cluster-regime-gate \
   --execute
 ```
 
@@ -417,7 +409,7 @@ Run the current deployment baseline backtest:
 .venv/bin/python -m bot.backtest.rank_decay_exit_experiment
 ```
 
-This writes the fixed top-30 TP/SL baseline plus the rejected rank-decay
+This writes the older TP/SL baseline plus the rejected rank-decay
 candidate for comparison.
 
 Run the generic live-like portfolio backtest manually:
@@ -531,14 +523,14 @@ should train artifacts from local paginated history first.
 
 ## Operational Notes
 
-### Fixed Data Windows
+### Fixed V1 Artifacts
 
-The intended live research policy is explicit:
+The intended live policy is explicit:
 
 ```text
-ridge / alpha model:    3 months of 1h data, refit weekly
-regime cluster library: 24 months of 1h data, refit monthly
-hourly live trading:    use the latest saved artifacts; do not refit hourly
+ridge / alpha model:    train once from the latest 3 months of 1h data
+regime cluster library: train once from the latest 24 months of 1h data
+hourly live trading:    use saved artifacts; do not refit or promote automatically
 ```
 
 The old `--history-limit` startup training path is still available, but it is
@@ -551,8 +543,8 @@ Collect a long local candle history:
 .venv/bin/python -m bot.main collect-history \
   --pairs "$PAIRS" \
   --interval 1h \
-  --start 2024-07-01 \
-  --end 2026-07-01 \
+  --start 2024-01-12 \
+  --end 2026-07-12 \
   --output-dir data/candles
 ```
 
@@ -590,26 +582,21 @@ Run the fixed-vs-scheduled OOS refit comparison:
   --cluster-min-trades 50
 ```
 
+For the walk-forward panel used to select V1 over scheduled refit, add:
+
+```bash
+  --folds 10 \
+  --fold-step-days 7 \
+  --common-history-universe \
+  --workers 2
+```
+
 Train the saved live artifacts:
 
 ```bash
 .venv/bin/python -m bot.main train-live-models \
-  --features data/features/live_1h_features_30m.csv \
   --pairs "$PAIRS" \
-  --model-dir data/models \
-  --model momentum_only \
-  --ridge-train-months 3 \
-  --regime-train-months 24 \
-  --top-k 1 \
-  --max-new-entries 1 \
-  --max-positions 3 \
-  --position-fraction 0.25 \
-  --tp 0.03 \
-  --sl 0.015 \
-  --fee-bps 10 \
-  --slippage-bps 5 \
-  --cluster-n-clusters 4 \
-  --cluster-min-trades 50
+  --model-dir data/models
 ```
 
 This writes:
@@ -626,21 +613,15 @@ Run live from saved artifacts:
   --pairs "$PAIRS" \
   --model-dir data/models \
   --cluster-regime-gate \
-  --top-k 1 \
-  --max-new-entries 1 \
-  --max-positions 3 \
-  --position-fraction 0.25 \
-  --tp 0.03 \
-  --sl 0.015 \
   --execute
 ```
 
 Operational cadence:
 
 ```text
-weekly:  refresh candles, rebuild features, rerun train-live-models for ridge
-monthly: refresh candles, rebuild features, rerun train-live-models for ridge + regime
-hourly:  live bot only scores/trades with the saved artifacts
+before deploy: train-live-models writes ridge_selection.json and cluster_regime_gate.json
+hourly:        live bot scores/trades with the saved artifacts
+replacement:   refresh data and retrain only after reviewing backtest/live diagnostics
 ```
 
 For live testing, use `tmux` so the bot keeps running if the terminal disconnects:

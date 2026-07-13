@@ -231,6 +231,31 @@ def load_model_frame(
     return df.sort_values(["pair", "timestamp"]).reset_index(drop=True)
 
 
+def bar_delta(frame: pd.DataFrame) -> pd.Timedelta:
+    """Infer the median bar spacing from a timestamped model frame."""
+    times = pd.Series(pd.to_datetime(frame["timestamp"], utc=True).drop_duplicates().sort_values())
+    if len(times) < 2:
+        return pd.Timedelta(0)
+    return pd.Timedelta(times.diff().dropna().median())
+
+
+def labeled_training_slice(
+    frame: pd.DataFrame,
+    *,
+    train_start: pd.Timestamp,
+    train_end: pd.Timestamp,
+    horizon: int,
+) -> pd.DataFrame:
+    """Select training rows whose forward labels are known before train_end."""
+    cutoff = pd.Timestamp(train_end) - bar_delta(frame) * horizon
+    mask = (
+        (frame["timestamp"] >= pd.Timestamp(train_start))
+        & (frame["timestamp"] < pd.Timestamp(train_end))
+        & (frame["timestamp"] <= cutoff)
+    )
+    return frame[mask].copy()
+
+
 def make_folds(
     frame: pd.DataFrame,
     is_months: int = DEFAULT_IS_MONTHS,

@@ -8,11 +8,13 @@ from typing import Any
 import pandas as pd
 
 from bot.backtest.ridge_score_portfolio import _entry_regime_for_training, _simulate_scored_window
+from bot.config import DEPLOYMENT_POLICY
 from bot.model_store import save_cluster_gate, save_ridge_selection
 from bot.strategy.regime import ClusterRegimeGateConfig, add_decision_time_regime_features, train_cluster_regime_gate
 from bot.strategy.ridge import (
     DEFAULT_RIDGE_ALPHAS,
     RidgeSelection,
+    labeled_training_slice,
     load_model_frame,
     score_frame,
     select_ridge_model,
@@ -45,7 +47,19 @@ def train_live_artifacts(
         as_of_ts = as_of_ts.tz_convert("UTC")
 
     ridge_start = as_of_ts - pd.DateOffset(months=ridge_train_months)
-    ridge_train = frame[(frame["timestamp"] >= ridge_start) & (frame["timestamp"] < as_of_ts)].copy()
+    regime_start = as_of_ts - pd.DateOffset(months=regime_train_months)
+    _validate_pair_history(
+        frame,
+        pairs=pairs,
+        required_start=regime_start,
+        required_end=as_of_ts,
+    )
+    ridge_train = labeled_training_slice(
+        frame,
+        train_start=ridge_start,
+        train_end=as_of_ts,
+        horizon=horizon,
+    )
     if ridge_train.empty:
         raise ValueError("ridge training window is empty")
     target_col = f"forward_return_{horizon}"
@@ -56,7 +70,6 @@ def train_live_artifacts(
         ridge_alphas=ridge_alphas,
     )
 
-    regime_start = as_of_ts - pd.DateOffset(months=regime_train_months)
     regime_frame = frame[(frame["timestamp"] >= regime_start) & (frame["timestamp"] < as_of_ts)].copy()
     if regime_frame.empty:
         raise ValueError("regime training window is empty")
@@ -89,6 +102,7 @@ def train_live_artifacts(
 
     common_metadata = {
         "feature_path": str(feature_path),
+        "deployment_policy": DEPLOYMENT_POLICY,
         "pairs": list(pairs),
         "as_of": as_of_ts.isoformat(),
         "horizon": horizon,
@@ -126,3 +140,29 @@ def selection_metadata_summary(selection: RidgeSelection, metadata: dict[str, An
         "train_end": metadata.get("train_end"),
         "train_months": metadata.get("train_months"),
     }
+
+
+def _validate_pair_history(
+    frame: pd.DataFrame,
+    *,
+    pairs: tuple[str, ...],
+    required_start: pd.Timestamp,
+    required_end: pd.Timestamp,
+) -> None:
+    coverage = frame.groupby("pair", observed=True)["timestamp"].agg(["min", "max"])
+    missing = sorted(set(pairs) - set(coverage.index))
+    too_short = [
+        pair
+        for pair, row in coverage.loc[[pair for pair in pairs if pair in coverage.index]].iterrows()
+        if pd.Timestamp(row["min"]) > required_start or pd.Timestamp(row["max"]) < required_end
+    ]
+    problems = []
+    if missing:
+        problems.append("missing pairs: " + ", ".join(missing))
+    if too_short:
+        problems.append(
+            f"pairs without full history from {required_start} through {required_end}: "
+            + ", ".join(sorted(too_short))
+        )
+    if problems:
+        raise ValueError("; ".join(problems))

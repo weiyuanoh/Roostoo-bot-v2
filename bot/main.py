@@ -13,6 +13,7 @@ import pandas as pd
 from bot.binance_data import BinanceData
 from bot.config import (
     DATA_DIR,
+    DEPLOYMENT_FEATURE_PATH,
     LIVE_CYCLE_DELAY_SECONDS,
     LIVE_FORWARD_HORIZON,
     LIVE_HISTORY_LIMIT,
@@ -369,8 +370,8 @@ def add_live_args(parser: argparse.ArgumentParser) -> None:
         default=LIVE_MAX_POSITIONS,
         help="Maximum total open positions; 0 derives from position fraction",
     )
-    parser.add_argument("--tp", type=float, default=LIVE_TAKE_PROFIT, help="Take-profit return, e.g. 0.5")
-    parser.add_argument("--sl", type=float, default=LIVE_STOP_LOSS, help="Stop-loss return, e.g. 0.2")
+    parser.add_argument("--tp", type=float, default=LIVE_TAKE_PROFIT, help="Take-profit return, e.g. 0.03")
+    parser.add_argument("--sl", type=float, default=LIVE_STOP_LOSS, help="Stop-loss return, e.g. 0.015")
     parser.add_argument(
         "--regime-throttle",
         action="store_true",
@@ -563,7 +564,7 @@ def main() -> int:
     features.add_argument("--output", required=True)
 
     train_models = subparsers.add_parser("train-live-models", help="Train persisted live ridge/regime artifacts")
-    train_models.add_argument("--features", required=True)
+    train_models.add_argument("--features", default=str(DEPLOYMENT_FEATURE_PATH))
     train_models.add_argument("--pairs", default="all")
     train_models.add_argument("--model-dir", default=str(MODEL_DIR))
     train_models.add_argument("--as-of", default=None, help="UTC cutoff; defaults to latest feature timestamp")

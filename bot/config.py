@@ -57,20 +57,57 @@ LOG_CONSOLE = os.getenv("BOT_LOG_CONSOLE", "1").strip().lower() not in {
 LIMIT_ORDER_TIMEOUT_SECONDS = int(os.getenv("LIMIT_ORDER_TIMEOUT_SECONDS", "90"))
 LIMIT_ORDER_OFFSET_BPS = float(os.getenv("LIMIT_ORDER_OFFSET_BPS", "1"))
 
+# --- V1 deployment profile ---
+#
+# The current live profile is the fixed-artifact V1 policy selected from the
+# 10-fold refit-policy panel. Keep these defaults aligned with README commands,
+# train-live-models, and live execution.
+DEPLOYMENT_PAIRS = [
+    "AAVE/USD",
+    "ADA/USD",
+    "APT/USD",
+    "AVAX/USD",
+    "BNB/USD",
+    "BTC/USD",
+    "DOGE/USD",
+    "DOT/USD",
+    "ETH/USD",
+    "FET/USD",
+    "FIL/USD",
+    "HBAR/USD",
+    "ICP/USD",
+    "LINK/USD",
+    "LTC/USD",
+    "NEAR/USD",
+    "PAXG/USD",
+    "PEPE/USD",
+    "SOL/USD",
+    "SUI/USD",
+    "TRX/USD",
+    "UNI/USD",
+    "WLD/USD",
+    "XRP/USD",
+    "ZEC/USD",
+]
+DEPLOYMENT_FEATURE_PATH = Path(
+    os.getenv("DEPLOYMENT_FEATURE_PATH", str(PROJECT_ROOT / "data" / "features" / "live_1h_features_30m.csv"))
+)
+DEPLOYMENT_POLICY = os.getenv("DEPLOYMENT_POLICY", "v1_fixed_regime")
+
 # --- Live ridge score strategy defaults ---
 LIVE_STATE_PATH = Path(os.getenv("LIVE_STATE_PATH", str(PROJECT_ROOT / "data" / "live_state.json")))
 LIVE_INTERVAL = os.getenv("LIVE_INTERVAL", "1h")
 LIVE_HISTORY_LIMIT = int(os.getenv("LIVE_HISTORY_LIMIT", "1000"))
 LIVE_FORWARD_HORIZON = int(os.getenv("LIVE_FORWARD_HORIZON", "24"))
-LIVE_MODEL = os.getenv("LIVE_MODEL", "momentum_plus_roll_plus_interaction")
-LIVE_POSITION_FRACTION = float(os.getenv("LIVE_POSITION_FRACTION", str(1 / 20)))
-LIVE_TAKE_PROFIT = float(os.getenv("LIVE_TAKE_PROFIT", os.getenv("LIVE_EXIT_THRESHOLD", "0.50")))
-LIVE_STOP_LOSS = float(os.getenv("LIVE_STOP_LOSS", os.getenv("LIVE_EXIT_THRESHOLD", "0.50")))
+LIVE_MODEL = os.getenv("LIVE_MODEL", "momentum_only")
+LIVE_POSITION_FRACTION = float(os.getenv("LIVE_POSITION_FRACTION", "0.25"))
+LIVE_TAKE_PROFIT = float(os.getenv("LIVE_TAKE_PROFIT", os.getenv("LIVE_EXIT_THRESHOLD", "0.03")))
+LIVE_STOP_LOSS = float(os.getenv("LIVE_STOP_LOSS", os.getenv("LIVE_EXIT_THRESHOLD", "0.015")))
 LIVE_CYCLE_DELAY_SECONDS = int(os.getenv("LIVE_CYCLE_DELAY_SECONDS", "5"))
 LIVE_MIN_HISTORY_BARS = int(os.getenv("LIVE_MIN_HISTORY_BARS", "200"))
-LIVE_TOP_K = int(os.getenv("LIVE_TOP_K", "0"))
-LIVE_MAX_NEW_ENTRIES = int(os.getenv("LIVE_MAX_NEW_ENTRIES", "0"))
-LIVE_MAX_POSITIONS = int(os.getenv("LIVE_MAX_POSITIONS", "0"))
+LIVE_TOP_K = int(os.getenv("LIVE_TOP_K", "1"))
+LIVE_MAX_NEW_ENTRIES = int(os.getenv("LIVE_MAX_NEW_ENTRIES", "1"))
+LIVE_MAX_POSITIONS = int(os.getenv("LIVE_MAX_POSITIONS", "3"))
 
 # --- Research/live model window policy ---
 RIDGE_TRAIN_MONTHS = int(os.getenv("RIDGE_TRAIN_MONTHS", "3"))
@@ -78,9 +115,11 @@ RIDGE_REFIT_DAYS = int(os.getenv("RIDGE_REFIT_DAYS", "7"))
 REGIME_TRAIN_MONTHS = int(os.getenv("REGIME_TRAIN_MONTHS", "24"))
 REGIME_REFIT_DAYS = int(os.getenv("REGIME_REFIT_DAYS", "30"))
 
-# Keep the old 43-coin universe available as a starting point. New strategy work
-# should test any narrower universe explicitly before trading it live.
-TRADEABLE_COINS = [
+# `all` means the current deployable V1 universe. Extra Binance symbol mappings
+# remain below for future research, but live/training defaults should not drift
+# into symbols outside this fixed set without an explicit experiment.
+TRADEABLE_COINS = list(DEPLOYMENT_PAIRS)
+KNOWN_BINANCE_PAIRS = [
     "BTC/USD",
     "ETH/USD",
     "SOL/USD",

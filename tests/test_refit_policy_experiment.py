@@ -2,7 +2,10 @@ import pandas as pd
 import pytest
 
 from bot.backtest.refit_policy_experiment import (
+    OosFold,
     build_refit_segments,
+    build_oos_folds,
+    filter_common_history_pairs,
     latest_oos_window,
     ridge_training_slice,
     run_refit_policy_backtest,
@@ -80,6 +83,47 @@ def test_latest_oos_window_fails_clearly_without_regime_history():
 
     with pytest.raises(ValueError, match="not enough history.*24-month regime window"):
         latest_oos_window(frame, os_months=2, required_train_months=24)
+
+
+def test_build_oos_folds_steps_backward_and_returns_chronological_folds():
+    frame = _synthetic_refit_frame(days=150)
+
+    folds = build_oos_folds(
+        frame,
+        os_months=1,
+        required_train_months=1,
+        folds=3,
+        fold_step_days=7,
+    )
+
+    assert [fold.fold_id for fold in folds] == [0, 1, 2]
+    assert folds[0].os_start < folds[1].os_start < folds[2].os_start
+    assert folds[1].os_start - folds[0].os_start == pd.Timedelta(days=7)
+
+
+def test_common_history_filter_drops_pairs_without_full_fold_coverage():
+    frame = _synthetic_refit_frame(days=120)
+    stale = frame[frame["pair"].eq("P0/USD")].copy()
+    stale["pair"] = "STALE/USD"
+    stale = stale.iloc[24 * 10 : -24 * 10]
+    frame = pd.concat([frame, stale], ignore_index=True)
+    folds = [
+        OosFold(
+            fold_id=0,
+            os_start=pd.Timestamp("2025-03-15", tz="UTC"),
+            os_end=pd.Timestamp("2025-04-15", tz="UTC"),
+        ),
+        OosFold(
+            fold_id=1,
+            os_start=pd.Timestamp("2025-03-22", tz="UTC"),
+            os_end=pd.Timestamp("2025-04-22", tz="UTC"),
+        ),
+    ]
+
+    filtered, pairs = filter_common_history_pairs(frame, os_folds=folds, required_train_months=2)
+
+    assert "STALE/USD" not in pairs
+    assert set(filtered["pair"].unique()) == set(pairs)
 
 
 def test_fixed_policy_uses_one_ridge_and_regime_artifact():
