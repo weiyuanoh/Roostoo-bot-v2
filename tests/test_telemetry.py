@@ -1,6 +1,14 @@
 import pytest
+import pandas as pd
 
-from bot.telemetry import closed_trade_record, json_safe, order_telemetry_record, slippage_bps, stable_id
+from bot.telemetry import (
+    closed_trade_record,
+    json_safe,
+    log_score_snapshot,
+    order_telemetry_record,
+    slippage_bps,
+    stable_id,
+)
 
 
 class Intent:
@@ -84,3 +92,50 @@ def test_closed_trade_record_reports_positive_tp_return():
 def test_json_safe_converts_non_json_values():
     payload = json_safe({"value": float("nan")})
     assert payload["value"] is None
+
+
+def test_log_score_snapshot_marks_cluster_gate_decisions(monkeypatch):
+    records = []
+    monkeypatch.setattr("bot.telemetry.log_jsonl", lambda filename, payload: records.append(payload))
+    scores = pd.DataFrame(
+        [
+            {"pair": "BTC/USD", "open_time": 1, "timestamp": "t1", "close": 100.0, "ridge_score": 0.5},
+            {"pair": "ETH/USD", "open_time": 1, "timestamp": "t1", "close": 50.0, "ridge_score": 0.4},
+        ]
+    )
+
+    log_score_snapshot(
+        cycle_id="cycle",
+        scores=scores,
+        price_map={"BTC/USD": 100.0, "ETH/USD": 50.0},
+        held_pairs=set(),
+        entry_pairs={"BTC/USD"},
+        exit_pairs=set(),
+        model="momentum_only",
+        alpha=0.1,
+        strategy_params={},
+        entry_gate_decisions=[
+            {
+                "pair": "BTC/USD",
+                "cluster_gate_allowed": True,
+                "cluster_id": 3,
+                "cluster_distance": 1.2,
+                "cluster_reason": "allowed_cluster",
+            },
+            {
+                "pair": "ETH/USD",
+                "cluster_gate_allowed": False,
+                "cluster_id": 1,
+                "cluster_distance": 4.5,
+                "cluster_reason": "blocked_cluster",
+            },
+        ],
+    )
+
+    by_pair = {record["pair"]: record for record in records}
+    assert by_pair["BTC/USD"]["cluster_gate_checked"] is True
+    assert by_pair["BTC/USD"]["cluster_gate_allowed"] is True
+    assert by_pair["BTC/USD"]["cluster_id"] == 3
+    assert by_pair["ETH/USD"]["cluster_gate_checked"] is True
+    assert by_pair["ETH/USD"]["cluster_gate_allowed"] is False
+    assert by_pair["ETH/USD"]["cluster_reason"] == "blocked_cluster"

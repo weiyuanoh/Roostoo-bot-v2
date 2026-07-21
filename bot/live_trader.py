@@ -273,6 +273,11 @@ class RidgeLiveTrader:
             model=self.selection.model if self.selection else self.config.model,
             alpha=self.selection.alpha if self.selection else None,
             strategy_params=strategy_params,
+            entry_gate_decisions=cycle.entry_gate_decisions,
+        )
+        gate_checks = len(cycle.entry_gate_decisions)
+        gate_allowed = sum(
+            bool(decision.get("cluster_gate_allowed")) for decision in cycle.entry_gate_decisions
         )
 
         results = {
@@ -296,7 +301,11 @@ class RidgeLiveTrader:
                 "train_start": self.cluster_gate_metadata.get("train_start"),
                 "train_end": self.cluster_gate_metadata.get("train_end"),
                 "allowed_clusters": sorted(self.cluster_gate.allowed_clusters) if self.cluster_gate else [],
+                "checks": gate_checks,
+                "allowed_checks": gate_allowed,
+                "blocked_checks": gate_checks - gate_allowed,
             },
+            "entry_gate_decisions": cycle.entry_gate_decisions,
             "entries": [intent.__dict__ for intent in entries],
             "exits": [intent.__dict__ for intent in exits],
             "orders": [],

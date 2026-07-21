@@ -225,6 +225,13 @@ logs/closed_trades.jsonl    closed-trade attribution for successful exits
 logs/monitor_events.jsonl   health/risk findings, local-only for now
 ```
 
+When the cluster regime gate is enabled, `live_cycles.jsonl` also records
+`cluster_gate.checks`, `cluster_gate.allowed_checks`,
+`cluster_gate.blocked_checks`, and the per-candidate `entry_gate_decisions`.
+The matching `live_scores.jsonl` rows include `cluster_gate_checked`,
+`cluster_gate_allowed`, `cluster_id`, `cluster_distance`, and
+`cluster_reason` so blocked rank candidates can be studied after the run.
+
 Generated monitoring reports:
 
 ```text

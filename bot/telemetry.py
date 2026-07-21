@@ -123,15 +123,22 @@ def log_score_snapshot(
     model: str,
     alpha: float | None,
     strategy_params: dict[str, Any],
+    entry_gate_decisions: list[dict[str, Any]] | None = None,
 ) -> None:
     ranked = scores.copy()
     if "ridge_score" in ranked.columns:
         ranked["rank"] = ranked["ridge_score"].rank(method="first", ascending=False)
     else:
         ranked["rank"] = np.nan
+    gate_by_pair = {
+        str(decision.get("pair")): decision
+        for decision in entry_gate_decisions or []
+        if decision.get("pair") is not None
+    }
     records = []
     for row in ranked.itertuples(index=False):
         pair = str(getattr(row, "pair"))
+        gate_decision = gate_by_pair.get(pair, {})
         records.append(
             {
                 "logged_at": utc_now_iso(),
@@ -146,6 +153,11 @@ def log_score_snapshot(
                 "held": pair in held_pairs,
                 "intended_entry": pair in entry_pairs,
                 "intended_exit": pair in exit_pairs,
+                "cluster_gate_checked": bool(gate_decision),
+                "cluster_gate_allowed": gate_decision.get("cluster_gate_allowed"),
+                "cluster_id": gate_decision.get("cluster_id"),
+                "cluster_distance": gate_decision.get("cluster_distance"),
+                "cluster_reason": gate_decision.get("cluster_reason"),
                 "model": model,
                 "alpha": alpha,
                 **strategy_params,
